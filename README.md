@@ -277,44 +277,15 @@ python $SKILL_DIR/qa_report.py status
 
 ---
 
-## PICOS判定标准
+## PICOS规则
 
-| 要素 | 纳入标准 | 排除码 |
-|------|----------|--------|
-| **P** (Population) | 高等教育学生/培训学员（本科、研究生、住院医师、专科培训学员） | E1 |
-| **I** (Intervention) | HMD头戴式VR（Oculus/HTC Vive/Meta Quest/Pico等头显设备） | E2 |
-| **C** (Comparator) | 有非VR对照组（传统教学、物理模拟、无训练等） | E5 |
-| **O** (Outcomes) | 程序性/动作技能 outcome，有retention（≥1周延迟后测）或transfer（迁移到新任务/真实环境） | E3, E4 |
-| **S** (Study Design) | RCT（随机对照试验）或准实验设计 | E6 |
+PICOS纳入/排除标准**不在skill中硬编码**，而是由每个项目独立配置。
 
-**排除码优先级**：如同时满足多个排除条件，标第一个命中的排除码（E1→E9）。
-
-| 排除码 | 含义 | 典型场景 |
-|--------|------|----------|
-| E1 | 非目标人群 | 患者、K-12学生、企业员工 |
-| E2 | 非VR干预 | 桌面VR模拟器(LapSim/EyeSi)、AR/MR、纯物理模拟器、360°视频(无交互) |
-| E3 | 非程序性技能 | 认知知识（笔试成绩）、态度、满意度 |
-| E4 | 无retention/transfer | 仅有即时后测，无≥1周延迟测试或迁移测试 |
-| E5 | 无对照组 | 单组前后测设计 |
-| E6 | 非实验设计 | 质性研究、调查、案例报告 |
-| E7 | 综述/理论 | 系统综述、Meta分析、评论、研究方案 |
-| E8 | 非英文 | 非英文发表 |
-| E9 | 其他 | 以上均不适用 |
-
----
-
-## 设备类型判定速查
-
-| 关键词 | 判定 | 说明 |
-|--------|------|------|
-| HMD / head-mounted / head-worn | ✅ HMD_VR | 明确头戴式 |
-| Oculus / HTC Vive / Meta Quest / Pico | ✅ HMD_VR | 已知HMD品牌 |
-| LapSim / EyeSi / MIST-VR / dV-Trainer / Simbionix | ❌ Desktop_VR | 已知桌面VR |
-| da Vinci Skills Simulator / FLS trainer | ❌ Desktop_VR | 机器人/腹腔镜桌面模拟器 |
-| VR simulator + 手术领域（腹腔镜/眼科/关节镜） | 📌 Desktop_VR | 推断（标注"推断"） |
-| 仅"VR"未说明设备 | ⚠️ 需确认 | 无法判定 → MAYBE |
-| 360° video 无交互 | ❌ 非VR | 非交互式视频 |
-| augmented reality / AR / mixed reality / MR | ❌ 非VR | AR/MR不是VR |
+- 模板：`templates/PICOS_RULES.template.md`
+- 项目文件：`{项目}/03_Screening/PICOS_RULES.md`
+- `init` 时自动从模板复制到项目目录
+- 子agent筛选前读取项目目录下的 `PICOS_RULES.md`
+- 换项目/换研究问题 → 修改项目的 `PICOS_RULES.md` 即可
 
 ---
 
