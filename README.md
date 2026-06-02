@@ -1,216 +1,114 @@
-# screen-repro v1.0 — 可复现的AI文献筛选系统
+# screen-repro — 可复现的AI文献筛选系统
 
-> ⚠️ **此版本已废弃**，请新项目使用 `@screen-repro`（v2.0 AI+Python版）。
-> v1.0 保留仅供历史参考。
+> **AI负责思考，Python负责说实话。**
+> 用于系统综述/Meta分析的全文筛选阶段。所有判定可溯源、可复现、可审计。
 
 ---
 
 ## 快速开始
 
-### 1. 调用方式
+```bash
+# 新项目，只需说一句话
+"使用screen-repro筛选文献"
+
+# 主agent自动完成：
+# 1. 初始化项目目录 + 复制配置文件
+# 2. 自动识别文献总数
+# 3. 断点恢复（如有中断）
+# 4. 逐篇派发子agent筛选
+# 5. 生成QA报告（MAYBE清单 + 随机抽样）
+```
+
+**用户全程无需手动操作文件。**
+
+---
+
+## 版本历史
+
+| 版本 | 标签 | 状态 | 核心变化 |
+|------|------|:--:|----------|
+| **v2.1** | `v2.1` | ✅ 当前 | Python全面接管机械操作，一键初始化，自动循环 |
+| v2.0 | `v2.0` | 📦 存档 | AI+Python混合，Python负责计数/记账 |
+| v1.0 | `v1.0` | ⚠️ 废弃 | 纯AI版，仅保留历史参考 |
+
+---
+
+## v2.1 vs v2.0 变更清单
+
+### 🆕 新增功能
+| # | 功能 | 说明 |
+|---|------|------|
+| 1 | **一键初始化** | `progress_manager.py init` 自动创建所有目录+从模板复制 PICOS_RULES.md / RATE_LIMIT.md |
+| 2 | **智能启动** | 用户只需说"开始筛选"，主agent自动检测项目状态、初始化、断点恢复 |
+| 3 | **QA报告** | `qa_report.py` 筛选完成后自动生成 QA_REPORT.md（MAYBE清单+随机抽样≥10%/5%） |
+| 4 | **PDF自动提取** | `pdf_extractor.py` MinerU API优先→超限PyMuPDF回退→自动质量检查 |
+| 5 | **速率退避** | `progress_manager.py retry-wait` 指数退避30→60→120→240秒 |
+
+### 🔧 重构改进
+| # | 改进 | 旧方案 | 新方案 |
+|---|------|--------|--------|
+| 6 | **JSON返回协议** | 子agent返回自由文本 | 子agent返回结构化JSON，Python验证schema |
+| 7 | **MD文件写入** | 子agent用Write工具写文件 | `record_writer.py` 统一写入（验证→填模板→MD→CSV→进度） |
+| 8 | **CSV管理** | 主agent手动追加CSV | Python全权管理，主agent禁止操作CSV |
+| 9 | **verify修复逻辑** | 未定义 | 明确4条修复规则（MD↔progress自动修复） |
+| 10 | **包结构** | Python脚本放在项目目录 | 迁移到 `~/.workbuddy/skills/screen-repro/scripts/`，跨项目复用 |
+| 11 | **PDF缺失处理** | 未定义 | 子agent返回skipped JSON，标记SKIPPED，等用户补PDF |
+| 12 | **错误处理** | 未定义 | 异常速查表，6种异常各有标准处理流程 |
+| 13 | **循环铁律** | 可能中途暂停 | 禁止中途询问用户，全程自动直到完成 |
+| 14 | **RATE_LIMIT模板** | 占位符 | 预填mimo/mimo-v2.5默认参数（RPM 100, TPM 10M） |
+
+### 📁 目录结构
 
 ```
-@screen-repro-v1 筛选第X篇：{Author}_{Year}，PDF路径：{path}
-```
-
-或：
-
-```
-@screen-repro-v1 开始筛选
-```
-
-### 2. 前提条件
-
-确保你的项目结构已建立：
-
-```
-03_Screening/
-├── pdfs/                          # PDF原始文件
-├── mining_output/                 # 提取的文本文件
-├── screening_records/             # 筛选记录
-│   ├── INCLUDE/
-│   ├── EXCLUDE/
-│   └── MAYBE/
-├── screening_progress.json        # 进度记录
-├── screening_summary.csv          # 汇总追踪表
-└── PICOS_RULES.md                 # 筛选标准（必须有！）
+~/.workbuddy/skills/screen-repro/        # skill包（跨项目复用）
+├── SKILL.md
+├── README.md
+├── scripts/                              # Python引擎
+│   ├── progress_manager.py               # 进度管理 + 智能初始化
+│   ├── pdf_extractor.py                  # PDF文本提取
+│   ├── record_writer.py                  # JSON验证 + 记录写入
+│   └── qa_report.py                      # QA报告生成
+└── templates/                            # 模板文件
+    ├── PICOS_RULES.template.md
+    ├── RATE_LIMIT.template.md
+    ├── SCREENING_RECORD.template.md
+    ├── SCREENING_RECORD_QUICK.template.md
+    └── PROGRESS.template.json
 ```
 
 ---
 
 ## 核心原则
 
-| 原则 | 含义 |
-|------|------|
-| **零幻觉** | 只读原文，禁止推测，所有判定必须有原文引用 |
-| **上下文隔离** | 每次只处理一篇PDF，独立子agent，互不污染 |
-| **可溯源** | 每条判定都引用原文页码+段落，可人工复核 |
-| **拿不准就MAYBE** | 任何PICOS要素不明确 → 整篇标MAYBE |
+| 原则 | AI做的事 | Python做的事 |
+|------|---------|-------------|
+| **语义判断** | 读PDF、理解Methods、PICOS判定 | — |
+| **机械操作** | — | 提取文本、验证JSON、写MD、追加CSV、更新进度 |
+| **不可出错** | 拿不准就MAYBE | 确定性操作，零幻觉 |
 
 ---
 
-## 筛选流程
+## 回退指南
 
-### 模式A：自动批量（推荐）
+```bash
+git clone https://github.com/zouzibo-tech/screen-repro.git
+cd screen-repro
 
-用户只需发送：`开始筛选`
+# 查看所有版本
+git tag
 
-系统自动执行：
-
-```
-1. 读取 PICOS_RULES.md + 文献列表
-2. 检查进度文件，支持断点恢复
-3. 每次派发1个子agent，间隔3秒
-4. 每篇完成后写入筛选记录 + 更新进度
-5. 全部完成后输出汇总报告
-```
-
-### 模式B：单篇手动
-
-用户发送：`筛选第X篇：Chen_2024，PDF路径：03_Screening/pdfs/Chen_2024.pdf`
-
-系统直接处理该篇，输出筛选记录。
-
----
-
-## PICOS判定标准
-
-| 要素 | 纳入标准 | 排除码 |
-|------|----------|--------|
-| **P** | 高等教育学生/培训学员 | E1 |
-| **I** | HMD头戴式VR | E2 |
-| **C** | 有非VR对照组 | E5 |
-| **O** | 有retention（≥1周）或transfer | E4 |
-| **S** | RCT或准实验 | E6 |
-
-**其他排除码**：
-- E3: 非程序性技能
-- E7: 综述/理论文章
-- E8: 非英文
-- E9: 其他原因
-
----
-
-## 设备类型判定（重点）
-
-| 关键词 | 判定 |
-|--------|------|
-| HMD / head-mounted / head-worn | ✅ HMD |
-| Oculus / HTC Vive / Meta Quest / Pico | ✅ HMD |
-| LapSim / EyeSi / MIST-VR / dV-Trainer | ✅ Desktop |
-| VR + 手术领域 | 📌 推断 Desktop |
-| 仅"VR"未说明设备 | ⚠️ 需确认 |
-
----
-
-## 筛选记录模板
-
-每篇文献生成独立 MD 文件，位于 `screening_records/{INCLUDE/EXCLUDE/MAYBE}/`
-
-模板结构：
-
-```markdown
-# {Author}_{Year} 全文筛选记录
-
-## 判定结果：{INCLUDE/EXCLUDE/MAYBE}
-## 排除码：{E1-E9}（如EXCLUDE）
-
-## PICOS逐项判定
-
-### P - 人群
-- **判定**：{符合/不符合/不确定}
-- **原文证据**：> "..." （页码X，段落Y）
-
-### I - 干预
-- **判定**：{符合/不符合/不确定}
-- **设备类型**：{HMD/桌面VR/不明}
-- **原文证据**：> "..." （页码X，段落Y）
-
-...（C/O/S同理）
-
-## 最终判定理由
-...
-
-## 反面证据
-（如有支持不符合的证据，也需列出）
+# 回退到任意版本
+git checkout v1.0   # 纯AI版
+git checkout v2.0   # AI+Python初版
+git checkout v2.1   # 最新版
 ```
 
 ---
 
-## 速率限制
+## 仓库
 
-默认配置（可在 `RATE_LIMIT.md` 中修改）：
-
-| 参数 | 默认值 |
-|------|--------|
-| 并发数 | 1（严格串行） |
-| 间隔 | 3秒 |
-| 重试等待 | 30秒 |
+https://github.com/zouzibo-tech/screen-repro
 
 ---
 
-## 进度管理
-
-### 进度文件：`screening_progress.json`
-
-```json
-{
-  "status": "running",
-  "current": "Chen_2024",
-  "total": 400,
-  "completed": ["Wang_2023", "Li_2022", ...],
-  "started_at": "2026-06-01T10:00:00"
-}
-```
-
-### 断点恢复
-
-如果模型中断，系统会自动：
-
-1. 读取 `screening_progress.json`
-2. 跳过 `completed` 列表中的文献
-3. 从 `current` 或下一篇继续
-
----
-
-## 质量控制
-
-| 检查 | 建议 |
-|------|------|
-| 人工复核 MAYBE | 全部复核 |
-| 人工抽样 INCLUDE | ≥10% |
-| 人工抽样 EXCLUDE | ≥5% |
-| 一致性检查 | 相似设计应一致判定 |
-
----
-
-## 常见问题
-
-**Q：为什么每次只读一篇PDF？**
-
-A：防止AI跨文污染——把A论文的Methods误认为B论文。每次独立上下文，保证判定的真实性。
-
-**Q：MAYBE是什么意思？**
-
-A：任何一个PICOS要素无法从原文明确判定 → 整篇标MAYBE，需人工复核。不是"可能纳入"，是"AI说不准"。
-
-**Q：能不能并行处理多篇？**
-
-A：v1.0 严格串行。如需并发，请手动创建多个 batch 目录，各运行一个独立筛选任务。
-
-**Q：为什么没有进度条？**
-
-A：每篇完成后立即写入 `screening_progress.json`，断点后可恢复，进度数据比可视化重要。
-
----
-
-## 版本说明
-
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| v1.0 | 2026-05-31 | 纯AI版，已废弃 |
-| v2.0 | 2026-06-01 | AI+Python混合版，当前推荐 |
-
----
-
-*screen-repro v1.0 — 可复现的逐篇全文筛选协议*
+*screen-repro v2.1 — 可复现的全文筛选 | 2026-06-02*
