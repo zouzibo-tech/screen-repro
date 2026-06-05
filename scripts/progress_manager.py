@@ -432,23 +432,42 @@ def fix_pdf_names():
             if exact in unmatched_pdfs:
                 unmatched_pdfs.remove(exact)
 
-    # 3b. 计算所有Key的模糊匹配候选
+    # 3b. 作者+年份匹配（主要匹配方式）
     candidates = []  # (score, key, pdf)
     keys_needing_match = [k for k in keys if k not in mapping]
 
+    # 读取CSV中的年份信息
+    csv_years = {}
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            k = row.get("Key", "").strip()
+            y = row.get("Year", "").strip()
+            if k and y:
+                csv_years[k] = y
+
     for key in keys_needing_match:
-        best_score = 0.0
+        # 从Key提取作者姓氏和年份
+        parts = key.rsplit('_', 1)
+        if len(parts) < 2:
+            unmatched_keys.append(key)
+            continue
+        
+        author_last = parts[0].split(',')[0].split(' ')[0].lower()
+        year = csv_years.get(key, '')
+        
+        # 在PDF文件名中查找
         best_pdf = None
         for pdf in pdf_files:
             if pdf in used_pdfs:
                 continue
-            score = fuzzy_score(key, pdf)
-            if score > best_score:
-                best_score = score
+            pdf_lower = pdf.lower()
+            if author_last in pdf_lower and year in pdf_lower:
                 best_pdf = pdf
-
-        if best_pdf and best_score >= 0.7:
-            candidates.append((best_score, key, best_pdf))
+                break
+        
+        if best_pdf:
+            candidates.append((1.0, key, best_pdf))  # 作者+年份匹配，分数1.0
         else:
             unmatched_keys.append(key)
 
