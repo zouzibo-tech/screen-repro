@@ -356,13 +356,17 @@ def fuzzy_score(key: str, pdf_name: str) -> float:
             pdf_author = match.group(1).strip()
             pdf_year = match.group(2).strip()
 
+            # 合著者处理：Key通常只有第一作者，PDF含"和XXX"
+            # "Zapf和Ujiki" → 提取第一作者 "Zapf"
+            pdf_first_author = re.split(r'[和&]', pdf_author)[0].strip()
+
             # 比较 Author 和 Year
-            if normalize(key_author) == normalize(pdf_author) and key_year == pdf_year:
+            if normalize(key_author) == normalize(pdf_first_author) and key_year == pdf_year:
                 return 0.98  # 高置信度匹配
 
             # 只 Year 匹配 + Author 部分匹配
             if key_year == pdf_year:
-                author_sim = difflib.SequenceMatcher(None, normalize(key_author), normalize(pdf_author)).ratio()
+                author_sim = difflib.SequenceMatcher(None, normalize(key_author), normalize(pdf_first_author)).ratio()
                 if author_sim >= 0.6:
                     return 0.85 + author_sim * 0.1  # 0.91 ~ 0.95
 
