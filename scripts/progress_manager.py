@@ -375,19 +375,20 @@ def fuzzy_score(key: str, pdf_name: str) -> float:
 
 def fix_pdf_names():
     """
-    一次性纠偏：扫描 pdfs/ 目录，与文献池 CSV 中的 Key 匹配。
+    PDF文件名标题匹配：扫描 pdfs/ 目录，与文献池 CSV 匹配。
     输出 pdf_mapping.json，后续筛选时查表。
 
-    匹配策略（三级）：
-    1. 精确文件名匹配 → 直接记录
-    2. 文件名模糊匹配（作者+年份）→ 自动记录
-    3. PDF内容匹配（读取第一页标题）→ 自动记录
+    匹配策略（四级）：
+    1. 精确文件名匹配（Key.pdf）
+    2. PDF文件名标题匹配（从文件名提取标题，匹配CSV标题）
+    3. 作者+年份匹配（宽松匹配）
     4. 无法匹配 → 列出给用户确认
 
-    AI不参与此过程，全部由Python确定性操作。
+    核心思路：PDF文件名格式为 "Author 等 - Year - Title.pdf"，
+    提取 Year 后面的标题部分，直接去文献库匹配文献标题。
     """
+    import re
     import difflib
-    import fitz  # PyMuPDF
 
     pdfs_dir = BASE / "pdfs"
     if not pdfs_dir.exists():
@@ -407,198 +408,168 @@ def fix_pdf_names():
         print("❌ 未找到 dedup_pool_with_abstracts*.csv")
         return
     csv_path = csv_candidates[0]
-    keys = []
+    csv_data = {}  # key -> {title, author, year}
     with open(csv_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             k = row.get("Key", "").strip()
             if k:
-                keys.append(k)
-    print(f"[CSV] 读取到 {len(keys)} 个 Key")
+                csv_data[k] = {
+                    "title": row.get("Title", "").strip(),
+                    "author": row.get("Author", "").strip(),
+                    "year": row.get("Year", "").strip(),
+                }
+    print(f"[CSV] 读取到 {len(csv_data)} 个 Key")
 
-    # 3. 匹配（先计算所有候选，按分数排序后再分配，避免低分Key抢占高分Key的PDF）
-    mapping = {}       # key → pdf_filename
-    auto_matched = []  # (key, pdf, score)
-    unmatched_keys = []
-    unmatched_pdfs = list(pdf_files)  # 未被匹配的 PDF
+    # 3. 从PDF文件名提取标题
+    def extract_title_from_filename(name):
+        """从 'Author 等 - Year - Title.pdf' 提取标题"""
+        m = re.match(r'^.*?\s*-\s*\d{4}\s*-\s*(.+)\.pdf$', name)
+        return m.group(1).strip() if m else ''
+
+    def norm(t):
+        """标准化文本：小写、去标点、压缩空格"""
+        t = re.sub(r'[^a-z0-9\s]', '', t.lower())
+        return re.sub(r'\s+', ' ', t).strip()
+
+    # 4. 匹配
+    mapping = {}
+    auto_matched = []
+    unmatched_keys = list(csv_data.keys())
+    unmatched_pdfs = list(pdf_files)
     used_pdfs = set()
 
-    # 3a. 精确匹配
-    for key in keys:
+    # 4a. 精确文件名匹配
+    for key in list(unmatched_keys):
         exact = f"{key}.pdf"
         if exact in pdf_files:
             mapping[key] = exact
             used_pdfs.add(exact)
+            unmatched_keys.remove(key)
             if exact in unmatched_pdfs:
                 unmatched_pdfs.remove(exact)
 
-    # 3b. 作者+年份匹配（主要匹配方式）
-    candidates = []  # (score, key, pdf)
-    keys_needing_match = [k for k in keys if k not in mapping]
+    # 4b. PDF文件名标题匹配（核心方法）
+    # 建立 PDF文件名标题 -> PDF文件名 的索引
+    pdf_title_index = {}  # norm_title -> pdf_filename
+    for pdf in pdf_files:
+        if pdf in used_pdfs:
+            continue
+        title = extract_title_from_filename(pdf)
+        if title:
+            pdf_title_index[norm(title)] = pdf
 
-    # 读取CSV中的年份信息
-    csv_years = {}
-    with open(csv_path, encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            k = row.get("Key", "").strip()
-            y = row.get("Year", "").strip()
-            if k and y:
-                csv_years[k] = y
+    # 建立 CSV标题 -> Key 的索引
+    csv_title_index = {}  # norm_title -> key
+    for key, info in csv_data.items():
+        if key in mapping:
+            continue
+        csv_title_index[norm(info["title"])] = key
 
-    for key in keys_needing_match:
-        # 从Key提取作者姓氏和年份
+    # 匹配：用CSV标题去PDF标题索引中查找
+    title_matched = []
+    for norm_csv_title, key in csv_title_index.items():
+        if not norm_csv_title:
+            continue
+
+        # 精确匹配
+        if norm_csv_title in pdf_title_index:
+            pdf = pdf_title_index[norm_csv_title]
+            if pdf not in used_pdfs:
+                mapping[key] = pdf
+                used_pdfs.add(pdf)
+                title_matched.append((key, pdf, 1.0))
+                if key in unmatched_keys:
+                    unmatched_keys.remove(key)
+                if pdf in unmatched_pdfs:
+                    unmatched_pdfs.remove(pdf)
+                continue
+
+        # 模糊匹配（相似度≥0.8）
+        best_score = 0.0
+        best_pdf = None
+        for norm_pdf_title, pdf in pdf_title_index.items():
+            if pdf in used_pdfs:
+                continue
+            sim = difflib.SequenceMatcher(None, norm_csv_title[:80], norm_pdf_title[:80]).ratio()
+            if sim > best_score:
+                best_score = sim
+                best_pdf = pdf
+
+        if best_pdf and best_score >= 0.8:
+            mapping[key] = best_pdf
+            used_pdfs.add(best_pdf)
+            title_matched.append((key, best_pdf, best_score))
+            if key in unmatched_keys:
+                unmatched_keys.remove(key)
+            if best_pdf in unmatched_pdfs:
+                unmatched_pdfs.remove(best_pdf)
+
+    auto_matched.extend(title_matched)
+
+    # 4c. 作者+年份匹配（宽松匹配，处理未匹配的Key）
+    still_unmatched = []
+    for key in unmatched_keys:
+        info = csv_data.get(key, {})
         parts = key.rsplit('_', 1)
         if len(parts) < 2:
-            unmatched_keys.append(key)
+            still_unmatched.append(key)
             continue
-        
+
         author_last = parts[0].split(',')[0].split(' ')[0].lower()
-        year = csv_years.get(key, '')
-        
-        # 在PDF文件名中查找
-        best_pdf = None
+        year = info.get("year", "")
+
+        found = False
         for pdf in pdf_files:
             if pdf in used_pdfs:
                 continue
             pdf_lower = pdf.lower()
             if author_last in pdf_lower and year in pdf_lower:
-                best_pdf = pdf
+                mapping[key] = pdf
+                used_pdfs.add(pdf)
+                auto_matched.append((key, pdf, 1.0))
+                if pdf in unmatched_pdfs:
+                    unmatched_pdfs.remove(pdf)
+                found = True
                 break
-        
-        if best_pdf:
-            candidates.append((1.0, key, best_pdf))  # 作者+年份匹配，分数1.0
-        else:
-            unmatched_keys.append(key)
 
-    # 3c. 按分数从高到低排序，依次分配（避免低分Key抢占高分Key的PDF）
-    candidates.sort(key=lambda x: -x[0])
-    for score, key, pdf in candidates:
-        if pdf not in used_pdfs:
-            mapping[key] = pdf
-            used_pdfs.add(pdf)
-            auto_matched.append((key, pdf, score))
-            if pdf in unmatched_pdfs:
-                unmatched_pdfs.remove(pdf)
-        else:
-            # PDF已被更高分的Key占用，标记为未匹配
-            unmatched_keys.append(key)
-
-    # 3d. PDF内容匹配：读取未匹配PDF的第一页标题，与CSV标题匹配
-    import re
-    print(f"\n[PDF内容匹配] 开始读取PDF标题...")
-    pdf_titles = {}  # pdf_name → 提取的标题
-    for pdf in unmatched_pdfs:
-        try:
-            doc = fitz.open(str(pdfs_dir / pdf))
-            if len(doc) > 0:
-                text = doc[0].get_text('text')[:800]
-                doc.close()
-                # 提取标题：取第一段非空文本（通常是标题）
-                lines = [l.strip() for l in text.split('\n') if l.strip() and len(l.strip()) > 10]
-                if lines:
-                    pdf_titles[pdf] = lines[0][:200]
-        except Exception:
-            pass
-
-    print(f"[PDF内容匹配] 成功读取 {len(pdf_titles)} 个PDF标题")
-
-    # 读取CSV中的标题
-    csv_path = list(BASE.glob("dedup_pool_with_abstracts*.csv"))[0]
-    csv_titles = {}  # key → title
-    with open(csv_path, encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            k = row.get("Key", "").strip()
-            t = row.get("Title", "").strip()
-            if k and t:
-                csv_titles[k] = t
-
-    # 对未匹配Key，用标题匹配PDF
-    still_unmatched = []
-    content_matched = []
-
-    for key in unmatched_keys:
-        csv_title = csv_titles.get(key, "")
-        if not csv_title:
-            still_unmatched.append(key)
-            continue
-
-        # 标准化标题用于比较
-        def norm_title(t):
-            t = t.lower().strip()
-            t = re.sub(r'[^a-z0-9\s]', '', t)
-            t = re.sub(r'\s+', ' ', t)
-            return t
-
-        nt = norm_title(csv_title)
-        best_score = 0.0
-        best_pdf = None
-
-        for pdf, pdf_title in pdf_titles.items():
-            if pdf in used_pdfs:
-                continue
-            np = norm_title(pdf_title)
-            # 标题相似度
-            sim = difflib.SequenceMatcher(None, nt[:100], np[:100]).ratio()
-            if sim > best_score:
-                best_score = sim
-                best_pdf = pdf
-
-        if best_pdf and best_score >= 0.6:
-            mapping[key] = best_pdf
-            used_pdfs.add(best_pdf)
-            content_matched.append((key, best_pdf, best_score))
-            if best_pdf in unmatched_pdfs:
-                unmatched_pdfs.remove(best_pdf)
-        else:
+        if not found:
             still_unmatched.append(key)
 
-    # 更新匹配统计
-    auto_matched.extend(content_matched)
     unmatched_keys = still_unmatched
 
-    # 4. 输出结果
+    # 5. 输出结果
     save_mapping(mapping)
     print(f"\n{'='*60}")
     print(f"📊 PDF 匹配结果")
     print(f"{'='*60}")
-    print(f"  总 Key 数: {len(keys)}")
+    print(f"  总 Key 数: {len(csv_data)}")
     print(f"  精确匹配: {len(mapping) - len(auto_matched)}")
-    print(f"  文件名模糊匹配: {len(auto_matched) - len(content_matched)}")
-    print(f"  PDF内容标题匹配: {len(content_matched)}")
+    print(f"  PDF文件名标题匹配: {len(title_matched)}")
+    print(f"  作者+年份匹配: {len(auto_matched) - len(title_matched)}")
     print(f"  总匹配: {len(mapping)}")
     print(f"  未匹配 Key: {len(unmatched_keys)}")
     print(f"  未匹配 PDF: {len(unmatched_pdfs)}")
 
-    if content_matched:
-        print(f"\n📋 PDF内容匹配详情:")
-        for key, pdf, score in sorted(content_matched, key=lambda x: -x[2]):
-            csv_t = csv_titles.get(key, "")[:40]
-            print(f"   {key:30s} → {pdf[:40]:40s} ({score:.0%})")
-            print(f"     CSV标题: {csv_t}")
-
-    if auto_matched:
-        print(f"\n📋 模糊匹配详情（已自动记录）:")
-        for key, pdf, score in sorted(auto_matched, key=lambda x: -x[2]):
-            print(f"   {key:40s} → {pdf:50s} ({score:.0%})")
+    if title_matched:
+        print(f"\n📋 PDF文件名标题匹配详情:")
+        for key, pdf, score in sorted(title_matched, key=lambda x: -x[2])[:20]:
+            csv_t = csv_data.get(key, {}).get("title", "")[:40]
+            pdf_t = extract_title_from_filename(pdf)[:40]
+            print(f"   {key:30s} ↔ {pdf_t}")
+            if score < 1.0:
+                print(f"     相似度: {score:.0%}")
 
     if unmatched_keys:
-        print(f"\n⚠️ 未匹配的 Key（需人工确认 PDF）:")
+        print(f"\n⚠️ 未匹配的 Key ({len(unmatched_keys)}篇):")
         for k in unmatched_keys:
-            print(f"   ❓ {k}")
-
-    if unmatched_pdfs:
-        print(f"\n⚠️ 未匹配的 PDF（可能在 CSV 中没有对应 Key）:")
-        for p in unmatched_pdfs:
-            print(f"   📄 {p}")
+            info = csv_data.get(k, {})
+            has_pdf = any(info.get("author", "").split(",")[0].split(" ")[0].lower() in f.lower() for f in pdf_files)
+            status = "有PDF(错误)" if has_pdf else "无PDF"
+            print(f"   ❓ {k:30s} [{status}]")
 
     print(f"\n✅ 映射已保存: {MAPPING_FILE}")
     print(f"   共 {len(mapping)} 条映射")
-
-    if unmatched_keys or unmatched_pdfs:
-        print(f"\n💡 如需手动补充映射，可编辑 {MAPPING_FILE}")
-        print(f"   格式: {{\"Key\": \"actual_filename.pdf\", ...}}")
 
     return mapping, unmatched_keys, unmatched_pdfs
 
