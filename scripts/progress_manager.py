@@ -349,9 +349,9 @@ def fuzzy_score(key: str, pdf_name: str) -> float:
         key_year = key_parts[1].strip()
 
         # 从 PDF 文件名中提取 Author 和 Year（格式: Author 等 - Year - ...）
-        # 尝试匹配 "Author - Year" 或 "Author 等 - Year" 或 "Author和Author - Year"
-        # 支持带空格的作者名（如 "De La Garza 等 - 2019 - ..."）
-        match = re.match(r'^([\w\u4e00-\u9fff]+(?:\s+[\w\u4e00-\u9fff]+)*)[\s]*(?:等|和[\w\u4e00-\u9fff]+)?\s*-\s*(\d{4})', pdf_name)
+        # 支持带空格、连字符、和/等的作者名
+        # 如 "Al-Kadi和Donnon - 2013 - ..."、"De La Garza 等 - 2019 - ..."
+        match = re.match(r'^([\w\u4e00-\u9fff]+(?:[\s\-]+[\w\u4e00-\u9fff]+)*)[\s]*(?:等|和[\w\u4e00-\u9fff]+)?\s*-\s*(\d{4})', pdf_name)
         if match:
             pdf_author = match.group(1).strip()
             pdf_year = match.group(2).strip()
@@ -414,24 +414,27 @@ def fix_pdf_names():
                 keys.append(k)
     print(f"[CSV] 读取到 {len(keys)} 个 Key")
 
-    # 3. 匹配
+    # 3. 匹配（先计算所有候选，按分数排序后再分配，避免低分Key抢占高分Key的PDF）
     mapping = {}       # key → pdf_filename
     auto_matched = []  # (key, pdf, score)
     unmatched_keys = []
     unmatched_pdfs = list(pdf_files)  # 未被匹配的 PDF
     used_pdfs = set()
 
+    # 3a. 精确匹配
     for key in keys:
-        # 精确匹配
         exact = f"{key}.pdf"
         if exact in pdf_files:
             mapping[key] = exact
             used_pdfs.add(exact)
             if exact in unmatched_pdfs:
                 unmatched_pdfs.remove(exact)
-            continue
 
-        # 模糊匹配
+    # 3b. 计算所有Key的模糊匹配候选
+    candidates = []  # (score, key, pdf)
+    keys_needing_match = [k for k in keys if k not in mapping]
+
+    for key in keys_needing_match:
         best_score = 0.0
         best_pdf = None
         for pdf in pdf_files:
@@ -443,12 +446,21 @@ def fix_pdf_names():
                 best_pdf = pdf
 
         if best_pdf and best_score >= 0.7:
-            mapping[key] = best_pdf
-            used_pdfs.add(best_pdf)
-            auto_matched.append((key, best_pdf, best_score))
-            if best_pdf in unmatched_pdfs:
-                unmatched_pdfs.remove(best_pdf)
+            candidates.append((best_score, key, best_pdf))
         else:
+            unmatched_keys.append(key)
+
+    # 3c. 按分数从高到低排序，依次分配（避免低分Key抢占高分Key的PDF）
+    candidates.sort(key=lambda x: -x[0])
+    for score, key, pdf in candidates:
+        if pdf not in used_pdfs:
+            mapping[key] = pdf
+            used_pdfs.add(pdf)
+            auto_matched.append((key, pdf, score))
+            if pdf in unmatched_pdfs:
+                unmatched_pdfs.remove(pdf)
+        else:
+            # PDF已被更高分的Key占用，标记为未匹配
             unmatched_keys.append(key)
 
     # 4. 输出结果
