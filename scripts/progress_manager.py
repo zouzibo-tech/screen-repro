@@ -197,15 +197,37 @@ def verify():
         print("❌ 无进度文件")
         return
     # progress标记done但MD不存在 → 移除
-    missing = [k for k in d["completed"]
-               if not any((RECORDS / sd / f"{k}.md").exists() for sd in SUBDIRS)]
+    # 使用glob匹配，支持新的 {Author}_{Year}_{hash}.md 格式
+    missing = []
+    for k in d["completed"]:
+        found = False
+        for sd in SUBDIRS:
+            md_dir = RECORDS / sd
+            if md_dir.exists():
+                # 匹配旧格式 {key}.md 或新格式 {key}_*.md
+                if list(md_dir.glob(f"{k}.md")) or list(md_dir.glob(f"{k}_*.md")):
+                    found = True
+                    break
+        if not found:
+            missing.append(k)
     # MD存在但progress未标记 → 补标记
     unmarked = []
     for sd in SUBDIRS:
         md_dir = RECORDS / sd
         if md_dir.exists():
             for m in md_dir.glob("*.md"):
-                k = m.stem
+                stem = m.stem
+                # 从文件名提取key：可能是 Author_Year 或 Author_Year_hash
+                parts = stem.rsplit('_', 1)
+                if len(parts) >= 2:
+                    # 尝试提取 Author_Year 部分（去掉hash后缀）
+                    # 如果最后一部分是6位hex，则认为是hash，取前面部分
+                    if len(parts[-1]) == 6 and all(c in '0123456789abcdef' for c in parts[-1]):
+                        k = parts[0]
+                    else:
+                        k = stem
+                else:
+                    k = stem
                 if k not in d["completed"] and k != "TEMPLATE":
                     unmarked.append((sd, k))
 

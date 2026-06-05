@@ -279,11 +279,17 @@ echo '<JSON>' | PYTHONIOENCODING=utf-8 python $SKILL_DIR/record_writer.py -
    └─ PICOS五维度 result/evidence/analysis 完整性检查
    → 任一不通过 → 退出码1，拒绝写入
 
-2. 填入模板:
+2. 生成唯一文件名:
+   └─ {Author}_{Year}_{hash}.md
+   （hash = 标题前20字符的MD5前6位，解决同作者同年文献命名冲突）
+   （极端冲突兜底：如文件已存在，自动追加序号 _2, _3, ...）
+
+3. 填入模板:
    └─ 读取内置模板 → 替换占位符 → 生成MD内容
 
 3. 写入MD:
-   └─ screening_records/{decision}/{Author}_{Year}.md
+   └─ screening_records/{decision}/{Author}_{Year}_{hash}.md
+   （hash为标题前20字符的MD5前6位，解决同作者同年文献命名冲突）
 
 4. 追加CSV:
    └─ screening_summary.csv 追加一行

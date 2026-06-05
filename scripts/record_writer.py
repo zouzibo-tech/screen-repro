@@ -38,6 +38,7 @@ import sys
 import os
 import json
 import csv
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -252,7 +253,7 @@ def fill_template(data: dict) -> str:
     )
 
 
-def append_csv(data: dict):
+def append_csv(data: dict, md_filename: str = ""):
     """追加到screening_summary.csv"""
     exists = SUMMARY.exists()
     with open(SUMMARY, "a", encoding="utf-8-sig", newline="") as f:
@@ -285,7 +286,7 @@ def append_csv(data: dict):
             data.get("exclusion_code", ""),
             data.get("reason", ""),
             data.get("screening_date", ts()[:10]),
-            f"screening_records/{data.get('decision', '')}/{data.get('author', '')}_{data.get('year', '')}.md",
+            f"screening_records/{data.get('decision', '')}/{md_filename}",
         ])
     print(f"[CSV] 已追加: {data.get('author')}_{data.get('year')}")
 
@@ -348,14 +349,24 @@ def main():
     # 生成MD内容
     md_content = fill_template(data)
 
-    # 确定写入路径
+    # 生成唯一文件名（解决同作者同年文献命名冲突）
     decision = data.get("decision", "MAYBE")
     author = data.get("author", "unknown")
     year = data.get("year", "0000")
-    filename = f"{author}_{year}.md"
+    title = data.get("title", "")
+    # 标题前20字符的MD5前6位作为唯一标识
+    title_part = title[:20] if title else f"{author}_{year}"
+    hash_part = hashlib.md5(title_part.encode('utf-8')).hexdigest()[:6]
+    filename = f"{author}_{year}_{hash_part}.md"
     write_dir = RECORDS / decision
     os.makedirs(write_dir, exist_ok=True)
     write_path = write_dir / filename
+    # 极端冲突兜底：如果文件已存在，追加序号
+    counter = 2
+    while write_path.exists():
+        filename = f"{author}_{year}_{hash_part}_{counter}.md"
+        write_path = write_dir / filename
+        counter += 1
 
     # 写入MD
     try:
@@ -368,7 +379,7 @@ def main():
 
     # 追加CSV
     try:
-        append_csv(data)
+        append_csv(data, filename)
     except Exception as e:
         print(f"❌ CSV追加失败: {e}", file=sys.stderr)
         sys.exit(2)
