@@ -342,15 +342,16 @@ def fuzzy_score(key: str, pdf_name: str) -> float:
     if nk in np or np in nk:
         return 0.95
 
-    # 从 Key 中提取 Author 和 Year（格式: Author_Year）
-    key_parts = key.split('_')
+    # 从 Key 中提取 Author 和 Year（格式: Author_Year 或 De La Garza_2019）
+    key_parts = key.rsplit('_', 1)  # 从右边分割，处理 "De La Garza_2019" 的情况
     if len(key_parts) >= 2:
         key_author = key_parts[0].strip()
-        key_year = key_parts[-1].strip()
+        key_year = key_parts[1].strip()
 
         # 从 PDF 文件名中提取 Author 和 Year（格式: Author 等 - Year - ...）
         # 尝试匹配 "Author - Year" 或 "Author 等 - Year" 或 "Author和Author - Year"
-        match = re.match(r'^([\w\u4e00-\u9fff]+)[\s]*(?:等|和[\w\u4e00-\u9fff]+)?\s*-\s*(\d{4})', pdf_name)
+        # 支持带空格的作者名（如 "De La Garza 等 - 2019 - ..."）
+        match = re.match(r'^([\w\u4e00-\u9fff]+(?:\s+[\w\u4e00-\u9fff]+)*)[\s]*(?:等|和[\w\u4e00-\u9fff]+)?\s*-\s*(\d{4})', pdf_name)
         if match:
             pdf_author = match.group(1).strip()
             pdf_year = match.group(2).strip()
@@ -479,6 +480,200 @@ def fix_pdf_names():
         print(f"\n💡 如需手动补充映射，可编辑 {MAPPING_FILE}")
         print(f"   格式: {{\"Key\": \"actual_filename.pdf\", ...}}")
 
+    return mapping, unmatched_keys, unmatched_pdfs
+
+
+def fix_pdf_names_ai():
+    """
+    AI辅助匹配：对未匹配的Key，读取PDF第一页内容进行二次匹配。
+    Python负责提取文本，AI负责判断语义匹配。
+
+    流程：
+    1. 读取已有映射，找出未匹配的Key和PDF
+    2. 对每个未匹配Key，找相似度≥0.3的候选PDF
+    3. 用PyMuPDF提取候选PDF第一页文本
+    4. 输出候选列表（Key → 候选PDF → 第一页摘要）
+    5. 主agent派发子agent判断哪个候选正确
+    """
+    import re
+
+    # 1. 读取已有映射
+    mapping = load_mapping()
+    matched_pdfs = set(mapping.values())
+
+    # 2. 读取文献池CSV
+    csv_candidates = list(BASE.glob("dedup_pool_with_abstracts*.csv"))
+    if not csv_candidates:
+        print("❌ 未找到 dedup_pool_with_abstracts*.csv")
+        return
+    csv_path = csv_candidates[0]
+    keys = []
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            k = row.get("Key", "").strip()
+            if k:
+                keys.append(k)
+
+    # 3. 找到未匹配的Key和PDF
+    unmatched_keys = [k for k in keys if k not in mapping]
+    pdfs_dir = BASE / "pdfs"
+    unmatched_pdfs = [f.name for f in pdfs_dir.glob("*.pdf") if f.name not in matched_pdfs]
+
+    print(f"[AI匹配] 未匹配Key: {len(unmatched_keys)}, 未匹配PDF: {len(unmatched_pdfs)}")
+
+    if not unmatched_keys or not unmatched_pdfs:
+        print("✅ 无未匹配项，无需AI辅助")
+        return
+
+    # 4. 对每个未匹配Key，找候选PDF
+    candidates = {}
+    for key in unmatched_keys:
+        key_candidates = []
+        for pdf in unmatched_pdfs:
+            score = fuzzy_score(key, pdf)
+            if score >= 0.3:  # 低阈值，扩大候选范围
+                key_candidates.append((pdf, score))
+        if key_candidates:
+            key_candidates.sort(key=lambda x: -x[1])
+            candidates[key] = key_candidates[:5]  # 最多5个候选
+
+    print(f"[AI匹配] {len(candidates)} 个Key有候选PDF")
+
+    # 5. 提取候选PDF第一页文本
+    try:
+        import fitz
+    except ImportError:
+        print("[AI匹配] PyMuPDF未安装，尝试安装...")
+        os.system(f"{sys.executable} -m pip install PyMuPDF -q")
+        import fitz
+
+    output_lines = []
+    output_lines.append("# PDF 匹配候选列表")
+    output_lines.append("")
+    output_lines.append("> 对于每个未匹配的Key，列出相似度最高的候选PDF及第一页摘要。")
+    output_lines.append("> 请判断哪个候选PDF是正确的匹配。")
+    output_lines.append("")
+    output_lines.append("---")
+
+    for key, cands in candidates.items():
+        output_lines.append("")
+        output_lines.append(f"## Key: {key}")
+        output_lines.append("")
+        output_lines.append("| # | 候选PDF | 相似度 | 第一页摘要 |")
+        output_lines.append("|---|---------|--------|-----------|")
+
+        for i, (pdf, score) in enumerate(cands, 1):
+            pdf_path = pdfs_dir / pdf
+            first_page_text = ""
+            try:
+                doc = fitz.open(str(pdf_path))
+                if len(doc) > 0:
+                    first_page_text = doc[0].get_text("text")[:500].replace("\n", " ").strip()
+                doc.close()
+            except Exception as e:
+                first_page_text = f"[提取失败: {e}]"
+
+            # 截断过长的摘要
+            if len(first_page_text) > 200:
+                first_page_text = first_page_text[:200] + "..."
+
+            output_lines.append(f"| {i} | `{pdf}` | {score:.0%} | {first_page_text} |")
+
+        output_lines.append("")
+        output_lines.append(f"**判定**：填入正确的PDF编号（1-{len(cands)}），或填0表示都不匹配。")
+        output_lines.append("")
+
+    output_lines.append("---")
+    output_lines.append("")
+    output_lines.append("## 输出格式")
+    output_lines.append("")
+    output_lines.append("```json")
+    output_lines.append('{"Key1": 1, "Key2": 2, "Key3": 0}')
+    output_lines.append("```")
+    output_lines.append("")
+    output_lines.append("其中数字是候选PDF的编号，0表示都不匹配。")
+
+    # 6. 写入候选列表
+    candidates_file = BASE / "pdf_candidates_for_ai.md"
+    with open(candidates_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(output_lines))
+
+    print(f"\n✅ 候选列表已生成: {candidates_file}")
+    print(f"   共 {len(candidates)} 个Key需要AI判断")
+    print(f"\n💡 下一步：")
+    print(f"   1. 主agent读取 {candidates_file}")
+    print(f"   2. 对每个Key，读取候选PDF第一页，判断正确匹配")
+    print(f"   3. 输出JSON: {{\"Key\": 候选编号, ...}}")
+    print(f"   4. 调用 progress_manager.py apply-ai-matches '<JSON>' 更新映射")
+
+
+def apply_ai_matches(matches_json: str):
+    """
+    应用AI匹配结果。
+    输入格式: {"Key1": 1, "Key2": 2, "Key3": 0}
+    其中数字是候选PDF的编号，0表示都不匹配。
+    """
+    import re
+
+    try:
+        matches = json.loads(matches_json)
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON解析失败: {e}")
+        return
+
+    # 读取候选列表
+    candidates_file = BASE / "pdf_candidates_for_ai.md"
+    if not candidates_file.exists():
+        print("❌ 候选列表不存在，请先运行 fix-pdf-names-ai")
+        return
+
+    # 解析候选列表
+    content = candidates_file.read_text(encoding="utf-8")
+    current_key = None
+    candidates = {}
+
+    for line in content.split("\n"):
+        # 找到Key行
+        if line.startswith("## Key: "):
+            current_key = line.replace("## Key: ", "").strip()
+            candidates[current_key] = []
+        # 找到候选PDF行
+        elif current_key and line.startswith("| ") and "候选PDF" not in line and "---" not in line:
+            parts = line.split("|")
+            if len(parts) >= 4:
+                try:
+                    idx = int(parts[1].strip())
+                    pdf_name = parts[2].strip().strip("`")
+                    candidates[current_key].append((idx, pdf_name))
+                except ValueError:
+                    pass
+
+    # 应用匹配
+    mapping = load_mapping()
+    applied = 0
+    for key, choice in matches.items():
+        if choice == 0:
+            print(f"⏭️ {key} → 跳过（都不匹配）")
+            continue
+
+        if key not in candidates:
+            print(f"⚠️ {key} → 候选列表中不存在")
+            continue
+
+        # 找到对应的PDF
+        for idx, pdf_name in candidates[key]:
+            if idx == choice:
+                mapping[key] = pdf_name
+                applied += 1
+                print(f"✅ {key} → {pdf_name}")
+                break
+        else:
+            print(f"⚠️ {key} → 编号 {choice} 不存在")
+
+    save_mapping(mapping)
+    print(f"\n✅ 已应用 {applied} 条AI匹配，总映射: {len(mapping)} 条")
+
 
 # ====== CLI ======
 if __name__ == "__main__":
@@ -505,6 +700,10 @@ if __name__ == "__main__":
         summary()
     elif cmd == "fix-pdf-names":
         fix_pdf_names()
+    elif cmd == "fix-pdf-names-ai":
+        fix_pdf_names_ai()
+    elif cmd == "apply-ai-matches":
+        apply_ai_matches(sys.argv[2] if len(sys.argv) > 2 else "")
     else:
         print("用法: python progress_manager.py <命令>")
         print("  init         初始化进度文件")
@@ -513,3 +712,6 @@ if __name__ == "__main__":
         print("  update First Year Decision ExclCode  记录一篇")
         print("  verify       双重验证MD↔进度")
         print("  summary      汇总报告+标记完成")
+        print("  fix-pdf-names      PDF文件名纠偏（模糊匹配）")
+        print("  fix-pdf-names-ai   AI辅助匹配（读取PDF内容）")
+        print("  apply-ai-matches '<JSON>'  应用AI匹配结果")
