@@ -37,7 +37,13 @@ if [ ! -f "screening_progress.json" ]; then
     # → 自动创建 progress.json + summary.csv + 从模板复制PICOS_RULES.md/RATE_LIMIT.md + 创建子目录
 fi
 
-# 2. 检查是否已设置文献总数
+# 2. PDF 文件名纠偏（首次启动或 pdf_mapping.json 不存在时）
+if [ ! -f "pdf_mapping.json" ]; then
+    PYTHONIOENCODING=utf-8 python $SKILL_DIR/progress_manager.py fix-pdf-names
+    # → 扫描 pdfs/ 与文献池 CSV 匹配，生成 pdf_mapping.json
+fi
+
+# 3. 检查是否已设置文献总数
 PROGRESS=$(PYTHONIOENCODING=utf-8 python $SKILL_DIR/progress_manager.py check 2>&1)
 if echo "$PROGRESS" | grep -q "总数:0"; then
     # 自动从文献列表CSV中获取总数
@@ -57,6 +63,7 @@ PYTHONIOENCODING=utf-8 python $SKILL_DIR/progress_manager.py check
 | 检查项 | 文件/命令 | 不存在时 | 存在时 |
 |--------|----------|---------|--------|
 | 项目初始化 | `screening_progress.json` 存在？ | 执行 `init` | 跳过 |
+| PDF 纠偏 | `pdf_mapping.json` 存在？ | 执行 `fix-pdf-names` | 跳过 |
 | 文献总数 | `check` 输出 `总数:0`？ | 自动从 CSV 获取并 `set-total` | 跳过 |
 | 断点恢复 | `verify` + `check` | — | 总是执行 |
 
@@ -218,18 +225,20 @@ PYTHONIOENCODING=utf-8 python $SKILL_DIR/progress_manager.py check
 ### 子agent的工作（独立的，不知道其他文献）
 
 ```
-0. 检查PDF是否存在:
-   └─ 03_Screening/pdfs/{Author}_{Year}.pdf 不存在？
+0. 查找PDF实际文件名（解决文件名与Key不一致问题）:
+   → 读取 pdf_mapping.json，查找 "{Author}_{Year}" 对应的实际PDF文件名
+   → 如映射存在: PDF_PATH = pdfs/{映射的文件名}
+   → 如映射不存在: PDF_PATH = pdfs/{Author}_{Year}.pdf（回退到默认）
+   → 如两种路径都不存在:
       → 返回: {"status": "skipped", "author": "...", "year": "...", "reason": "PDF not found"}
-      → 不进行后续步骤（不提取、不判定、不写MD）
       → 主agent看到skipped后调用:
         PYTHONIOENCODING=utf-8 python $SKILL_DIR/progress_manager.py skip {Author} {Year}
 
 1. 读取 PICOS_RULES.md
 2. PDF文本提取 — 调用Python脚本（Python负责，AI不干预）:
    PYTHONIOENCODING=utf-8 python $SKILL_DIR/pdf_extractor.py \
-       03_Screening/pdfs/{Author}_{Year}.pdf \
-       03_Screening/mining_output/{Author}_{Year}_mining.md
+       {PDF_PATH} \
+       03_Screening/mining_output/{Author}_{Year}_{hash}_mining.md
    → 脚本自动: MinerU API优先 → 超限回退PyMuPDF → 质量检查
    → 退出码0=成功, 1=全部失败, 2=文本质量异常
 3. 读取提取结果: mining_output/{Author}_{Year}_mining.md (或.txt)

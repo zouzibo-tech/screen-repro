@@ -13,7 +13,7 @@ progress_manager.py — screen-repro v2.0 进度管理器
   python progress_manager.py summary                       # 汇总报告
 """
 
-import sys, os, json, csv
+import sys, os, json, csv, shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -303,6 +303,156 @@ def summary():
     print("\n✅ 已标记为 done")
 
 
+# ====== PDF 文件名纠偏 ======
+
+MAPPING_FILE = BASE / "pdf_mapping.json"
+
+
+def load_mapping():
+    if MAPPING_FILE.exists():
+        with open(MAPPING_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_mapping(m):
+    with open(MAPPING_FILE, "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=2, ensure_ascii=False)
+
+
+def normalize(s: str) -> str:
+    """标准化文件名：小写、去空格/连字符/下划线/括号等"""
+    import re
+    s = s.lower().strip()
+    s = re.sub(r'[\s_\-]+', '', s)          # 去空格/连字符/下划线
+    s = re.sub(r'[()[\]{}]', '', s)          # 去括号
+    s = re.sub(r'\.pdf$', '', s)             # 去扩展名
+    s = re.sub(r'[^a-z0-9\u4e00-\u9fff]', '', s)  # 只保留字母数字中文
+    return s
+
+
+def fuzzy_score(key: str, pdf_name: str) -> float:
+    """计算 Key 与 PDF 文件名的相似度（0~1）"""
+    nk = normalize(key)
+    np = normalize(pdf_name)
+    # 先检查 key 是否包含在 pdf 中（处理 Wang_2024 匹配 Wang_2024_VR_Education 的情况）
+    if nk in np or np in nk:
+        return 0.95
+    return difflib.SequenceMatcher(None, nk, np).ratio()
+
+
+def fix_pdf_names():
+    """
+    一次性纠偏：扫描 pdfs/ 目录，与文献池 CSV 中的 Key 匹配。
+    输出 pdf_mapping.json，后续筛选时查表。
+
+    匹配策略：
+    1. 精确匹配（忽略大小写）→ 直接记录
+    2. 模糊匹配（相似度 ≥ 0.7）→ 自动记录
+    3. 无法匹配 → 列出给用户确认
+
+    AI不参与此过程，全部由Python确定性操作。
+    """
+    import difflib
+
+    pdfs_dir = BASE / "pdfs"
+    if not pdfs_dir.exists():
+        print("❌ pdfs/ 目录不存在")
+        return
+
+    # 1. 扫描 pdfs/ 目录
+    pdf_files = [f.name for f in pdfs_dir.glob("*.pdf")]
+    if not pdf_files:
+        print("❌ pdfs/ 目录中没有 PDF 文件")
+        return
+    print(f"[PDF] 扫描到 {len(pdf_files)} 个 PDF 文件")
+
+    # 2. 读取文献池 CSV
+    csv_candidates = list(BASE.glob("dedup_pool_with_abstracts*.csv"))
+    if not csv_candidates:
+        print("❌ 未找到 dedup_pool_with_abstracts*.csv")
+        return
+    csv_path = csv_candidates[0]
+    keys = []
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            k = row.get("Key", "").strip()
+            if k:
+                keys.append(k)
+    print(f"[CSV] 读取到 {len(keys)} 个 Key")
+
+    # 3. 匹配
+    mapping = {}       # key → pdf_filename
+    auto_matched = []  # (key, pdf, score)
+    unmatched_keys = []
+    unmatched_pdfs = list(pdf_files)  # 未被匹配的 PDF
+    used_pdfs = set()
+
+    for key in keys:
+        # 精确匹配
+        exact = f"{key}.pdf"
+        if exact in pdf_files:
+            mapping[key] = exact
+            used_pdfs.add(exact)
+            if exact in unmatched_pdfs:
+                unmatched_pdfs.remove(exact)
+            continue
+
+        # 模糊匹配
+        best_score = 0.0
+        best_pdf = None
+        for pdf in pdf_files:
+            if pdf in used_pdfs:
+                continue
+            score = fuzzy_score(key, pdf)
+            if score > best_score:
+                best_score = score
+                best_pdf = pdf
+
+        if best_pdf and best_score >= 0.7:
+            mapping[key] = best_pdf
+            used_pdfs.add(best_pdf)
+            auto_matched.append((key, best_pdf, best_score))
+            if best_pdf in unmatched_pdfs:
+                unmatched_pdfs.remove(best_pdf)
+        else:
+            unmatched_keys.append(key)
+
+    # 4. 输出结果
+    save_mapping(mapping)
+    print(f"\n{'='*60}")
+    print(f"📊 PDF 文件名匹配结果")
+    print(f"{'='*60}")
+    print(f"  总 Key 数: {len(keys)}")
+    print(f"  精确匹配: {len(mapping) - len(auto_matched)}")
+    print(f"  模糊匹配: {len(auto_matched)}")
+    print(f"  未匹配 Key: {len(unmatched_keys)}")
+    print(f"  未匹配 PDF: {len(unmatched_pdfs)}")
+
+    if auto_matched:
+        print(f"\n📋 模糊匹配详情（已自动记录）:")
+        for key, pdf, score in sorted(auto_matched, key=lambda x: -x[2]):
+            print(f"   {key:40s} → {pdf:50s} ({score:.0%})")
+
+    if unmatched_keys:
+        print(f"\n⚠️ 未匹配的 Key（需人工确认 PDF）:")
+        for k in unmatched_keys:
+            print(f"   ❓ {k}")
+
+    if unmatched_pdfs:
+        print(f"\n⚠️ 未匹配的 PDF（可能在 CSV 中没有对应 Key）:")
+        for p in unmatched_pdfs:
+            print(f"   📄 {p}")
+
+    print(f"\n✅ 映射已保存: {MAPPING_FILE}")
+    print(f"   共 {len(mapping)} 条映射")
+
+    if unmatched_keys or unmatched_pdfs:
+        print(f"\n💡 如需手动补充映射，可编辑 {MAPPING_FILE}")
+        print(f"   格式: {{\"Key\": \"actual_filename.pdf\", ...}}")
+
+
 # ====== CLI ======
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -326,6 +476,8 @@ if __name__ == "__main__":
         verify()
     elif cmd == "summary":
         summary()
+    elif cmd == "fix-pdf-names":
+        fix_pdf_names()
     else:
         print("用法: python progress_manager.py <命令>")
         print("  init         初始化进度文件")
