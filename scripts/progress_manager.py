@@ -13,7 +13,7 @@ progress_manager.py — screen-repro v2.0 进度管理器
   python progress_manager.py summary                       # 汇总报告
 """
 
-import sys, os, json, csv, shutil
+import sys, os, json, csv, shutil, difflib
 from datetime import datetime
 from pathlib import Path
 
@@ -333,11 +333,38 @@ def normalize(s: str) -> str:
 
 def fuzzy_score(key: str, pdf_name: str) -> float:
     """计算 Key 与 PDF 文件名的相似度（0~1）"""
+    import re
+
     nk = normalize(key)
     np = normalize(pdf_name)
+
     # 先检查 key 是否包含在 pdf 中（处理 Wang_2024 匹配 Wang_2024_VR_Education 的情况）
     if nk in np or np in nk:
         return 0.95
+
+    # 从 Key 中提取 Author 和 Year（格式: Author_Year）
+    key_parts = key.split('_')
+    if len(key_parts) >= 2:
+        key_author = key_parts[0].strip()
+        key_year = key_parts[-1].strip()
+
+        # 从 PDF 文件名中提取 Author 和 Year（格式: Author 等 - Year - ...）
+        # 尝试匹配 "Author - Year" 或 "Author 等 - Year" 或 "Author和Author - Year"
+        match = re.match(r'^([\w\u4e00-\u9fff]+)[\s]*(?:等|和[\w\u4e00-\u9fff]+)?\s*-\s*(\d{4})', pdf_name)
+        if match:
+            pdf_author = match.group(1).strip()
+            pdf_year = match.group(2).strip()
+
+            # 比较 Author 和 Year
+            if normalize(key_author) == normalize(pdf_author) and key_year == pdf_year:
+                return 0.98  # 高置信度匹配
+
+            # 只 Year 匹配 + Author 部分匹配
+            if key_year == pdf_year:
+                author_sim = difflib.SequenceMatcher(None, normalize(key_author), normalize(pdf_author)).ratio()
+                if author_sim >= 0.6:
+                    return 0.85 + author_sim * 0.1  # 0.91 ~ 0.95
+
     return difflib.SequenceMatcher(None, nk, np).ratio()
 
 
