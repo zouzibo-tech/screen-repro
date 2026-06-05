@@ -378,14 +378,16 @@ def fix_pdf_names():
     一次性纠偏：扫描 pdfs/ 目录，与文献池 CSV 中的 Key 匹配。
     输出 pdf_mapping.json，后续筛选时查表。
 
-    匹配策略：
-    1. 精确匹配（忽略大小写）→ 直接记录
-    2. 模糊匹配（相似度 ≥ 0.7）→ 自动记录
-    3. 无法匹配 → 列出给用户确认
+    匹配策略（三级）：
+    1. 精确文件名匹配 → 直接记录
+    2. 文件名模糊匹配（作者+年份）→ 自动记录
+    3. PDF内容匹配（读取第一页标题）→ 自动记录
+    4. 无法匹配 → 列出给用户确认
 
     AI不参与此过程，全部由Python确定性操作。
     """
     import difflib
+    import fitz  # PyMuPDF
 
     pdfs_dir = BASE / "pdfs"
     if not pdfs_dir.exists():
@@ -463,16 +465,99 @@ def fix_pdf_names():
             # PDF已被更高分的Key占用，标记为未匹配
             unmatched_keys.append(key)
 
+    # 3d. PDF内容匹配：读取未匹配PDF的第一页标题，与CSV标题匹配
+    import re
+    print(f"\n[PDF内容匹配] 开始读取PDF标题...")
+    pdf_titles = {}  # pdf_name → 提取的标题
+    for pdf in unmatched_pdfs:
+        try:
+            doc = fitz.open(str(pdfs_dir / pdf))
+            if len(doc) > 0:
+                text = doc[0].get_text('text')[:800]
+                doc.close()
+                # 提取标题：取第一段非空文本（通常是标题）
+                lines = [l.strip() for l in text.split('\n') if l.strip() and len(l.strip()) > 10]
+                if lines:
+                    pdf_titles[pdf] = lines[0][:200]
+        except Exception:
+            pass
+
+    print(f"[PDF内容匹配] 成功读取 {len(pdf_titles)} 个PDF标题")
+
+    # 读取CSV中的标题
+    csv_path = list(BASE.glob("dedup_pool_with_abstracts*.csv"))[0]
+    csv_titles = {}  # key → title
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            k = row.get("Key", "").strip()
+            t = row.get("Title", "").strip()
+            if k and t:
+                csv_titles[k] = t
+
+    # 对未匹配Key，用标题匹配PDF
+    still_unmatched = []
+    content_matched = []
+
+    for key in unmatched_keys:
+        csv_title = csv_titles.get(key, "")
+        if not csv_title:
+            still_unmatched.append(key)
+            continue
+
+        # 标准化标题用于比较
+        def norm_title(t):
+            t = t.lower().strip()
+            t = re.sub(r'[^a-z0-9\s]', '', t)
+            t = re.sub(r'\s+', ' ', t)
+            return t
+
+        nt = norm_title(csv_title)
+        best_score = 0.0
+        best_pdf = None
+
+        for pdf, pdf_title in pdf_titles.items():
+            if pdf in used_pdfs:
+                continue
+            np = norm_title(pdf_title)
+            # 标题相似度
+            sim = difflib.SequenceMatcher(None, nt[:100], np[:100]).ratio()
+            if sim > best_score:
+                best_score = sim
+                best_pdf = pdf
+
+        if best_pdf and best_score >= 0.6:
+            mapping[key] = best_pdf
+            used_pdfs.add(best_pdf)
+            content_matched.append((key, best_pdf, best_score))
+            if best_pdf in unmatched_pdfs:
+                unmatched_pdfs.remove(best_pdf)
+        else:
+            still_unmatched.append(key)
+
+    # 更新匹配统计
+    auto_matched.extend(content_matched)
+    unmatched_keys = still_unmatched
+
     # 4. 输出结果
     save_mapping(mapping)
     print(f"\n{'='*60}")
-    print(f"📊 PDF 文件名匹配结果")
+    print(f"📊 PDF 匹配结果")
     print(f"{'='*60}")
     print(f"  总 Key 数: {len(keys)}")
     print(f"  精确匹配: {len(mapping) - len(auto_matched)}")
-    print(f"  模糊匹配: {len(auto_matched)}")
+    print(f"  文件名模糊匹配: {len(auto_matched) - len(content_matched)}")
+    print(f"  PDF内容标题匹配: {len(content_matched)}")
+    print(f"  总匹配: {len(mapping)}")
     print(f"  未匹配 Key: {len(unmatched_keys)}")
     print(f"  未匹配 PDF: {len(unmatched_pdfs)}")
+
+    if content_matched:
+        print(f"\n📋 PDF内容匹配详情:")
+        for key, pdf, score in sorted(content_matched, key=lambda x: -x[2]):
+            csv_t = csv_titles.get(key, "")[:40]
+            print(f"   {key:30s} → {pdf[:40]:40s} ({score:.0%})")
+            print(f"     CSV标题: {csv_t}")
 
     if auto_matched:
         print(f"\n📋 模糊匹配详情（已自动记录）:")
