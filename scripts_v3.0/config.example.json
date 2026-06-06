@@ -1,0 +1,42 @@
+{
+  "llm_backend": "openai",
+  "openai": {
+    "api_key": "YOUR_API_KEY_HERE",
+    "model": "gpt-4o-2024-08-06",
+    "base_url": "https://api.openai.com/v1",
+    "rpm": 100,
+    "tpm": 10000000
+  },
+  "anthropic": {
+    "api_key": "YOUR_API_KEY_HERE",
+    "model": "claude-sonnet-4-20250514",
+    "rpm": 60,
+    "tpm": 80000
+  },
+  "ollama": {
+    "model": "qwen2.5:72b",
+    "base_url": "http://localhost:11434",
+    "rpm": 9999,
+    "tpm": 999999999
+  },
+  "mimo": {
+    "api_key": "YOUR_MIMO_API_KEY",
+    "model": "mimo-v2.5",
+    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "rpm": 100,
+    "tpm": 10000000
+  },
+  "rate_limit": {
+    "enabled": true,
+    "default_rpm": 60,
+    "default_tpm": 100000,
+    "safety_margin": 0.8,
+    "backoff_base": 2,
+    "backoff_max": 60
+  },
+  "picos_rules_path": "PICOS_RULES.md",
+  "pdf_extractor": "pymupdf",
+  "mineru_api": "https://mineru.net/api/v1/agent/parse/file",
+  "max_text_length": 8000,
+  "cache_enabled": true
+}
