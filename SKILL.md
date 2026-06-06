@@ -1,7 +1,7 @@
 ---
 name: screen-repro
 description: >
-  screen-repro v3.0 — 专门用于系统综述/Meta分析中PICOS文献筛选的自动化工具。
+  screen-repro v3.1 — 专门用于系统综述/Meta分析中PICOS文献筛选的自动化工具。
   利用AI快速筛选，Python保证可复现性。AI筛选，Python把关，可复现为本。
 triggers: >
   screen-repro, 筛选, screen, 筛选文献, 筛选PDF, 全文筛选, 逐篇筛选,
@@ -10,7 +10,7 @@ tools: Read, Write, Edit, Bash, Glob
 model: inherit
 ---
 
-# screen-repro v3.0 — 可复现的PICOS文献筛选系统
+# screen-repro v3.1 — 可复现的PICOS文献筛选系统
 
 > **AI筛选，Python把关，可复现为本。**
 
@@ -34,13 +34,29 @@ model: inherit
 
 ---
 
-## 快速开始
+## 工作流程
 
-用户说"开始筛选"时，执行：
+### 完整流程（一键执行）
 
 ```bash
 cd {项目目录}
-python ~/.workbuddy/skills/screen-repro/scripts/screen.py run
+python screen.py workflow --ris xxx.ris
+```
+
+### 分步执行
+
+```bash
+# 步骤1：RIS导入
+python screen.py import --ris xxx.ris
+
+# 步骤2：预筛选+AI复核+人机协同
+python screen.py prescreen
+
+# 步骤3：PDF映射
+python screen.py pdf map
+
+# 步骤4：正常筛选
+python screen.py run
 ```
 
 ---
@@ -50,6 +66,8 @@ python ~/.workbuddy/skills/screen-repro/scripts/screen.py run
 | 命令 | 说明 |
 |------|------|
 | `screen.py init` | 初始化项目（创建目录、数据库、config模板） |
+| `screen.py import --ris xxx.ris` | 导入RIS文件 |
+| `screen.py prescreen` | 预筛选+AI复核+人机协同 |
 | `screen.py run` | 执行筛选循环（自动从断点恢复） |
 | `screen.py run --batch N` | 筛选N篇后暂停 |
 | `screen.py check` | 查看进度 |
@@ -58,6 +76,7 @@ python ~/.workbuddy/skills/screen-repro/scripts/screen.py run
 | `screen.py export` | 导出CSV |
 | `screen.py migrate` | 从v2.3迁移 |
 | `screen.py pdf map` | PDF映射 |
+| `screen.py workflow --ris xxx.ris` | 一键执行完整流程 |
 
 ---
 

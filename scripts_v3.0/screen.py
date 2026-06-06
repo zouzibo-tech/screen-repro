@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-screen.py — screen-repro v3.0 主编排器
+screen.py — screen-repro v3.1 主编排器
 ======================================
 单一入口，Python控制一切，AI只在PICOS判定时被调用。
 数据存储：SQLite（权威） + MD文件（人类可读）
 
 CLI命令:
     python screen.py init              # 初始化项目
+    python screen.py import --ris xxx.ris  # 导入RIS文件
+    python screen.py prescreen         # 预筛选+AI复核+人机协同
     python screen.py run               # 执行筛选循环
     python screen.py run --batch 10    # 筛选10篇后暂停
     python screen.py check             # 查看进度
@@ -15,10 +17,7 @@ CLI命令:
     python screen.py export            # 导出CSV
     python screen.py migrate           # 从v2.3迁移
     python screen.py pdf map           # PDF映射
-    python screen.py qa generate       # 生成QA报告
-    python screen.py qa resolve ...    # MAYBE复核
-    python screen.py qa confirm ...    # 抽样确认
-    python screen.py qa status         # QA进度
+    python screen.py workflow --ris xxx.ris  # 一键执行完整流程
 """
 
 import argparse
@@ -746,23 +745,33 @@ def migrate_from_v2(base: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="screen-repro v3.0 — 可复现的文献筛选系统",
+        description="screen-repro v3.1 — 可复现的文献筛选系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   python screen.py init              初始化项目
+  python screen.py import --ris xxx.ris  导入RIS文件
+  python screen.py prescreen         预筛选+AI复核+人机协同
   python screen.py run               执行筛选
   python screen.py run --batch 10    筛选10篇后暂停
   python screen.py check             查看进度
   python screen.py verify            验证一致性
   python screen.py export            导出CSV
-  python screen.py migrate           从v2.3迁移
+  python screen.py workflow --ris xxx.ris  一键执行完整流程
         """
     )
     sub = parser.add_subparsers(dest="command")
 
     # init
     sub.add_parser("init", help="初始化项目")
+
+    # import
+    import_p = sub.add_parser("import", help="导入RIS文件")
+    import_p.add_argument("--ris", required=True, help="RIS文件路径")
+
+    # prescreen
+    prescreen_p = sub.add_parser("prescreen", help="预筛选+AI复核+人机协同")
+    prescreen_p.add_argument("--batch", type=int, help="AI复核批次大小")
 
     # run
     run_p = sub.add_parser("run", help="执行筛选")
@@ -787,11 +796,22 @@ def main():
                       choices=["generate", "resolve", "confirm", "status"])
     qa_p.add_argument("args", nargs="*")
 
+    # workflow
+    workflow_p = sub.add_parser("workflow", help="一键执行完整流程")
+    workflow_p.add_argument("--ris", required=True, help="RIS文件路径")
+    workflow_p.add_argument("--batch", type=int, help="AI复核批次大小")
+
     args = parser.parse_args()
     base = Path.cwd()
 
     if args.command == "init":
         init_project(base)
+
+    elif args.command == "import":
+        import_ris(base, args.ris)
+
+    elif args.command == "prescreen":
+        run_prescreen(base, batch_size=args.batch)
 
     elif args.command == "run":
         orch = ScreeningOrchestrator(base)
@@ -824,8 +844,115 @@ def main():
     elif args.command == "qa":
         print("QA功能尚未实现")
 
+    elif args.command == "workflow":
+        run_workflow(base, args.ris, batch_size=args.batch)
+
     else:
         parser.print_help()
+
+
+def import_ris(base: Path, ris_path: str):
+    """导入RIS文件"""
+    from ris_parser import import_ris_to_db
+
+    # 检查RIS文件是否存在
+    ris_file = Path(ris_path)
+    if not ris_file.exists():
+        # 尝试在项目目录中查找
+        ris_file = base / ris_path
+        if not ris_file.exists():
+            print(f"错误: RIS文件不存在: {ris_path}")
+            sys.exit(1)
+
+    # 检查数据库是否存在
+    db_path = base / DB_FILE
+    if not db_path.exists():
+        print("错误: 数据库不存在，请先运行 init")
+        sys.exit(1)
+
+    # 导入RIS文件
+    print(f"导入RIS文件: {ris_file}")
+    result = import_ris_to_db(str(ris_file), str(db_path))
+
+    print(f"\n=== 导入结果 ===")
+    print(f"RIS记录数: {result['total_records']}")
+    print(f"导入: {result['imported']}")
+    print(f"跳过: {result['skipped']}")
+    print(f"数据库总数: {result['total_in_db']}")
+
+
+def run_prescreen(base: Path, batch_size: int = None):
+    """运行预筛选+AI复核+人机协同"""
+    from ai_reviewer import review_papers_in_db
+    from human_review import HumanReviewer
+
+    # 检查数据库是否存在
+    db_path = base / DB_FILE
+    if not db_path.exists():
+        print("错误: 数据库不存在，请先运行 init")
+        sys.exit(1)
+
+    # 检查配置文件是否存在
+    config_path = base / CONFIG_FILE
+    if not config_path.exists():
+        print("错误: 配置文件不存在，请先运行 init")
+        sys.exit(1)
+
+    # 加载配置
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+
+    # 运行AI复核
+    print("开始AI复核...")
+    review_result = review_papers_in_db(config, str(db_path), batch_size)
+
+    # 保存AI复核结果
+    review_result_path = base / "review_result.json"
+    with open(review_result_path, 'w', encoding='utf-8') as f:
+        json.dump(review_result, f, ensure_ascii=False, indent=2)
+    print(f"AI复核结果已保存到: {review_result_path}")
+
+    # 运行人机协同复核
+    print("\n开始人机协同复核...")
+    reviewer = HumanReviewer(str(db_path))
+    result = reviewer.interactive_review(review_result)
+    reviewer.close()
+
+    # 输出结果
+    print(f"\n操作结果：{result.get('action', 'unknown')}")
+
+
+def run_workflow(base: Path, ris_path: str, batch_size: int = None):
+    """一键执行完整流程"""
+    print("=" * 70)
+    print("screen-repro v3.1 完整工作流程")
+    print("=" * 70)
+    print()
+
+    # 步骤1：RIS导入
+    print("【步骤1】RIS导入")
+    print("-" * 70)
+    import_ris(base, ris_path)
+    print()
+
+    # 步骤2：预筛选+AI复核+人机协同
+    print("【步骤2】预筛选+AI复核+人机协同")
+    print("-" * 70)
+    run_prescreen(base, batch_size)
+    print()
+
+    # 步骤3：PDF映射
+    print("【步骤3】PDF映射")
+    print("-" * 70)
+    orch = ScreeningOrchestrator(base)
+    orch._map_pdfs()
+    print()
+
+    # 步骤4：正常筛选
+    print("【步骤4】正常筛选")
+    print("-" * 70)
+    print("预筛选完成，可以运行 python screen.py run 开始筛选")
+    print()
 
 
 if __name__ == "__main__":
