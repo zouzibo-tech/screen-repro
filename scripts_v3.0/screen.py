@@ -163,7 +163,22 @@ class ScreeningOrchestrator:
                 f"[{progress['processed']+1}/{progress['total']}] {paper['key']}"
             )
 
-            # 2. PDF文本提取
+            # 2. 预筛选：检查标题和摘要，排除综述类文章
+            should_exclude, reason = self._pre_screen(paper)
+            if should_exclude:
+                self.logger.info(f"  预筛选排除: {reason}")
+                # 添加到screening表，标记为EXCLUDE
+                self.db.conn.execute("""
+                    INSERT OR IGNORE INTO screening
+                    (key, decision, exclusion_code, reason, screened_at)
+                    VALUES (?, 'EXCLUDE', 'E1', ?, datetime('now'))
+                """, (paper["key"], reason))
+                self.db.conn.commit()
+                self.db.update_progress(paper["key"], "EXCLUDE")
+                processed += 1
+                continue
+
+            # 3. PDF文本提取
             try:
                 text, tool = self._extract_pdf(paper)
                 if text is None:
@@ -439,6 +454,101 @@ class ScreeningOrchestrator:
             json.dump(mapping, f, indent=2, ensure_ascii=False)
 
         self.logger.info(f"PDF映射完成: {len(mapping)}个文件")
+
+    # ====== 预筛选模块 ======
+
+    def _pre_screen(self, paper: dict) -> tuple[bool, str]:
+        """
+        预筛选：通过标题和摘要排除综述类文章
+        
+        返回:
+            (should_exclude, reason): 是否排除及原因
+        """
+        title = paper.get("title", "").lower()
+        author = paper.get("author", "").lower()
+        
+        # 综述类关键词（不区分大小写）
+        review_keywords = [
+            # 英文关键词
+            "systematic review",
+            "meta-analysis",
+            "meta analysis",
+            "narrative review",
+            "literature review",
+            "scoping review",
+            "umbrella review",
+            "critical review",
+            "comprehensive review",
+            "overview of reviews",
+            "review of reviews",
+            "a review",
+            "an update",
+            "updates on",
+            "current perspectives",
+            "state of the art",
+            "state-of-the-art",
+            "recent advances",
+            "recent developments",
+            "recent progress",
+            "a narrative",
+            "a scoping",
+            "a systematic",
+            "a comprehensive",
+            "a critical",
+            "an overview",
+            "an umbrella",
+            # 中文关键词
+            "综述",
+            "系统综述",
+            "荟萃分析",
+            "meta分析",
+            "文献综述",
+            "范围综述",
+            "伞状综述",
+            "叙述性综述",
+        ]
+        
+        # 标题模式匹配（正则表达式）
+        import re
+        review_patterns = [
+            r"^a\s+systematic\s+review",
+            r"^a\s+meta[\s-]analysis",
+            r"^a\s+narrative\s+review",
+            r"^a\s+scoping\s+review",
+            r"^systematic\s+review\s+and\s+meta[\s-]analysis",
+            r"^review\s+of\s+",
+            r"^overview\s+of\s+",
+            r"^state\s+of\s+the\s+art",
+            r"^recent\s+advances\s+in",
+            r"^recent\s+developments\s+in",
+            r"^current\s+perspectives\s+on",
+            r"^an?\s+update\s+on",
+        ]
+        
+        # 检查标题是否匹配综述模式
+        for pattern in review_patterns:
+            if re.search(pattern, title, re.IGNORECASE):
+                return True, f"综述类文献-标题匹配模式: {pattern}"
+        
+        # 检查标题是否包含综述关键词
+        for keyword in review_keywords:
+            if keyword in title:
+                return True, f"综述类文献-标题包含关键词: {keyword}"
+        
+        return False, ""
+
+    def _pre_screen_batch(self, papers: list[dict]) -> list[tuple[dict, bool, str]]:
+        """
+        批量预筛选
+        
+        返回:
+            [(paper, should_exclude, reason), ...]
+        """
+        results = []
+        for paper in papers:
+            should_exclude, reason = self._pre_screen(paper)
+            results.append((paper, should_exclude, reason))
+        return results
 
     # ====== 辅助方法 ======
 

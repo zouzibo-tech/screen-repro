@@ -91,11 +91,29 @@ python ~/.workbuddy/skills/screen-repro/scripts/screen.py run
 ```
 screen.py (主编排器)
     │
+    ├─ 预筛选模块 (标题/摘要快速排除综述类文章)
     ├─ db_manager.py (SQLite数据库)
     ├─ record_writer.py (双写MD + SQLite)
     ├─ picos_judge.py (AI判定，子进程隔离)
     └─ qa_report.py (QA报告)
 ```
+
+---
+
+## 预筛选模块
+
+**功能**：在PDF提取和AI判定之前，通过标题和摘要快速排除综述类文章。
+
+**触发条件**：标题包含以下关键词或匹配模式：
+- **关键词**：systematic review, meta-analysis, narrative review, scoping review, 综述, 荟萃分析等
+- **模式匹配**：标题以"A systematic review..."、"Recent advances in..."等开头
+
+**优势**：
+- 节省AI调用成本（无需提取PDF和调用LLM）
+- 加速筛选流程（毫秒级判定）
+- 100%确定性（基于规则，无幻觉）
+
+**排除码**：E1（综述类文献）
 
 ---
 
