@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-screen.py — screen-repro v3.2 主编排器
+screen.py — screen-repro v3.3 主编排器
 ======================================
 程序化优先：流程控制、校验、备份、报告全部程序化；AI仅保留给全文PICOS判定。
 数据存储：SQLite（权威） + MD文件（人类可读）

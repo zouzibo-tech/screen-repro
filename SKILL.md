@@ -1,7 +1,7 @@
 ---
 name: screen-repro
 description: >
-  screen-repro v3.2 — 专门用于系统综述/Meta分析中PICOS文献筛选的自动化工具。
+  screen-repro v3.3 — 专门用于系统综述/Meta分析中PICOS文献筛选的自动化工具。
   程序化优先：流程控制、校验、备份、报告全部程序化；AI仅保留给全文PICOS判定。
 triggers: >
   screen-repro, 筛选, screen, 筛选文献, 筛选PDF, 全文筛选, 逐篇筛选,
@@ -10,7 +10,7 @@ tools: Read, Write, Edit, Bash, Glob
 model: inherit
 ---
 
-# screen-repro v3.2 — 程序化优先的PICOS文献筛选系统
+# screen-repro v3.3 — 程序化优先的PICOS文献筛选系统
 
 > **程序主导，AI辅助，可复现为本。**
 
