@@ -14,6 +14,7 @@ import re
 import sys
 import json
 import sqlite3
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -172,15 +173,24 @@ class RisParser:
                 self.current_record['authors_str'] = '; '.join(
                     self.current_record['authors'])
 
-            # 生成key（Author_Year格式）
+            # 生成key（Author_Year格式，含首字母和标题Hash）
             first_author = ''
+            first_initial = ''
             if 'authors' in self.current_record and self.current_record['authors']:
-                first_author = self.current_record['authors'][0].split(',')[0].strip()
+                author_raw = self.current_record['authors'][0]
+                parts = author_raw.split(',')
+                first_author = parts[0].strip()
                 # 清理作者名中的特殊字符
                 first_author = re.sub(r'[^a-zA-Z\s-]', '', first_author).strip()
+                # 提取名字首字母
+                if len(parts) > 1:
+                    first_initial = parts[1].strip()[0] if parts[1].strip() else ''
 
             year = self.current_record.get('year', 0)
-            self.current_record['key'] = f"{first_author}_{year}"
+            # 标题Hash（用于同作者同年份多篇文献的区分）
+            title = self.current_record.get('title', '')
+            title_hash = hashlib.md5(title.encode()).hexdigest()[:6] if title else ''
+            self.current_record['key'] = f"{first_author}{first_initial}_{year}_{title_hash}"
 
             self.records.append(self.current_record)
 

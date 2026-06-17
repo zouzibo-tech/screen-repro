@@ -145,6 +145,13 @@ class DbManager:
             INSERT OR IGNORE INTO progress (id, total, processed, remaining, status)
             VALUES (1, 0, 0, 0, 'idle');
         """)
+
+        # 添加screening_round列（如果不存在）
+        try:
+            self.conn.execute("ALTER TABLE screening ADD COLUMN screening_round TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
         self.conn.commit()
 
     # ====== 文献库操作 ======
@@ -206,8 +213,8 @@ class DbManager:
                 pdf_path, mining_path, md_path,
                 screened_at, model, text_hash,
                 fingerprint, model_version, prompt_hash, extraction_method,
-                temperature, seed, llm_response_raw
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                temperature, seed, llm_response_raw, screening_round
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data.get("key"),
             data.get("decision"),
@@ -246,6 +253,7 @@ class DbManager:
             data.get("temperature", 0),
             data.get("seed", 42),
             data.get("llm_response_raw"),
+            data.get("screening_round", "正式筛选"),
         ))
         self.conn.commit()
 
@@ -286,51 +294,102 @@ class DbManager:
 
     def update_progress(self, key: str, decision: str):
         """
-        更新进度（原子事务）
+        同步进度缓存。
 
-        参数:
-            key: 文献key
-            decision: 决策（INCLUDE/EXCLUDE/MAYBE/SKIPPED/ERROR）
+        注意：progress 表不是权威数据源，只能由 papers/screening 实时重建。
+        这样可避免重复运行、覆盖写入、跳过记录等场景造成 processed > total。
         """
-        col_map = {
-            "INCLUDE": "include_count",
-            "EXCLUDE": "exclude_count",
-            "MAYBE": "maybe_count",
-            "SKIPPED": "skipped_count",
-            "ERROR": "error_count",
-        }
-        col = col_map.get(decision, "error_count")
+        self.rebuild_progress(current_key=key, status="running")
 
-        with self.conn:
-            # 更新计数
-            self.conn.execute(
-                f"UPDATE progress SET {col} = {col} + 1 WHERE id = 1"
-            )
-            # 更新总数和状态
-            self.conn.execute("""
-                UPDATE progress SET
-                    processed = include_count + exclude_count + maybe_count + skipped_count + error_count,
-                    remaining = MAX(0, total - processed),
-                    current_key = ?,
-                    status = 'running',
-                    last_updated = datetime('now')
-                WHERE id = 1
-            """, (key,))
-
-    def get_progress(self) -> dict:
-        """获取进度"""
+    def _stored_progress(self) -> dict:
+        """读取 progress 原始缓存行，不做修正。"""
         row = self.conn.execute(
             "SELECT * FROM progress WHERE id = 1"
         ).fetchone()
         return dict(row) if row else {}
 
-    def set_total(self, total: int):
-        """设置文献总数"""
-        self.conn.execute(
-            "UPDATE progress SET total = ?, remaining = MAX(0, ? - processed) WHERE id = 1",
-            (total, total)
-        )
+    def rebuild_progress(self, current_key: str = None,
+                         status: str = None) -> dict:
+        """从 papers/screening 权威表重建 progress 缓存并返回真实进度。"""
+        counts = self.count_by_decision()
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM papers"
+        ).fetchone()[0]
+        processed = self.conn.execute(
+            "SELECT COUNT(*) FROM screening"
+        ).fetchone()[0]
+        remaining = self.conn.execute("""
+            SELECT COUNT(*)
+            FROM papers p
+            LEFT JOIN screening s ON p.key = s.key
+            WHERE s.key IS NULL
+        """).fetchone()[0]
+
+        stored = self._stored_progress()
+        effective_status = status
+        if effective_status is None:
+            if total == 0:
+                effective_status = "idle"
+            elif remaining == 0:
+                effective_status = "done"
+            else:
+                effective_status = stored.get("status") or "running"
+                if effective_status == "done":
+                    effective_status = "running"
+
+        effective_current = current_key if current_key is not None else stored.get("current_key")
+
+        self.conn.execute("""
+            UPDATE progress SET
+                total = ?,
+                processed = ?,
+                remaining = ?,
+                current_key = ?,
+                status = ?,
+                include_count = ?,
+                exclude_count = ?,
+                maybe_count = ?,
+                skipped_count = ?,
+                error_count = ?,
+                started_at = COALESCE(started_at, datetime('now')),
+                last_updated = datetime('now')
+            WHERE id = 1
+        """, (
+            total,
+            processed,
+            remaining,
+            effective_current,
+            effective_status,
+            counts.get("INCLUDE", 0),
+            counts.get("EXCLUDE", 0),
+            counts.get("MAYBE", 0),
+            counts.get("SKIPPED", 0),
+            counts.get("ERROR", 0),
+        ))
         self.conn.commit()
+        return {
+            "id": 1,
+            "total": total,
+            "processed": processed,
+            "remaining": remaining,
+            "current_key": effective_current,
+            "status": effective_status,
+            "include_count": counts.get("INCLUDE", 0),
+            "exclude_count": counts.get("EXCLUDE", 0),
+            "maybe_count": counts.get("MAYBE", 0),
+            "skipped_count": counts.get("SKIPPED", 0),
+            "error_count": counts.get("ERROR", 0),
+            "started_at": stored.get("started_at"),
+            "last_updated": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def get_progress(self) -> dict:
+        """获取真实进度，并自动修复 progress 缓存。"""
+        return self.rebuild_progress()
+
+    def set_total(self, total: int):
+        """兼容旧接口：total 不再手工设置，而是从 papers 表重建。"""
+        self.rebuild_progress()
 
     def reset_progress(self):
         """重置进度（慎用）"""
@@ -414,17 +473,61 @@ class DbManager:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_summary(self) -> dict:
-        """获取汇总统计"""
+    def get_exclusion_distribution(self) -> list[dict]:
+        """按排除码分组统计 EXCLUDE 文献数量"""
+        rows = self.conn.execute("""
+            SELECT COALESCE(exclusion_code, '未分类') as code,
+                   COUNT(*) as cnt,
+                   GROUP_CONCAT(DISTINCT reason) as reasons
+            FROM screening
+            WHERE decision = 'EXCLUDE'
+            GROUP BY exclusion_code
+            ORDER BY cnt DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_picos_dimension_stats(self) -> dict:
+        """统计 INCLUDE 文献各 PICOS 维度 PASS/FAIL/UNCERTAIN 数量"""
+        stats = {}
+        for dim in ["p", "i", "c", "o", "s"]:
+            col = f"{dim}_result"
+            rows = self.conn.execute(f"""
+                SELECT
+                    {col} as result,
+                    COUNT(*) as cnt
+                FROM screening
+                WHERE decision = 'INCLUDE'
+                GROUP BY {col}
+            """).fetchall()
+            stats[dim.upper()] = {row["result"]: row["cnt"] for row in rows}
+        return stats
+
+    def get_include_without_pdf(self) -> list[dict]:
+        """获取 INCLUDE 但无 PDF 路径的文献"""
+        rows = self.conn.execute("""
+            SELECT s.key, p.author, p.year, p.title
+            FROM screening s
+            JOIN papers p ON s.key = p.key
+            WHERE s.decision = 'INCLUDE'
+              AND (s.pdf_path IS NULL OR s.pdf_path = '')
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_screening_time_range(self) -> dict:
+        """获取筛选记录的时间范围"""
         row = self.conn.execute("""
             SELECT
-                total, processed, remaining,
-                include_count, exclude_count, maybe_count,
-                skipped_count, error_count,
-                status, current_key, started_at, last_updated
-            FROM progress WHERE id = 1
+                MIN(screened_at) as first_screened,
+                MAX(screened_at) as last_screened,
+                COUNT(DISTINCT date(screened_at)) as screening_days
+            FROM screening
+            WHERE screened_at IS NOT NULL
         """).fetchone()
         return dict(row) if row else {}
+
+    def get_summary(self) -> dict:
+        """获取汇总统计（实时重建，避免读取陈旧 progress 缓存）"""
+        return self.rebuild_progress()
 
     def count_by_decision(self) -> dict[str, int]:
         """按决策统计数量"""
@@ -606,7 +709,7 @@ class DbManager:
 
     def update_decision(self, key: str, new_decision: str,
                         exclusion_code: str = None):
-        """更新筛选决策（用于QA复核）"""
+        """更新筛选决策（用于QA复核），并从权威表重建进度缓存。"""
         self.conn.execute("""
             UPDATE screening SET
                 decision = ?,
@@ -615,33 +718,7 @@ class DbManager:
             WHERE key = ?
         """, (new_decision, exclusion_code, key))
         self.conn.commit()
-
-        # 更新progress计数
-        with self.conn:
-            # 获取旧决策
-            old = self.conn.execute(
-                "SELECT decision FROM screening WHERE key = ?", (key,)
-            ).fetchone()
-            if old:
-                old_dec = old["decision"]
-                old_col = {
-                    "INCLUDE": "include_count",
-                    "EXCLUDE": "exclude_count",
-                    "MAYBE": "maybe_count",
-                }.get(old_dec)
-                new_col = {
-                    "INCLUDE": "include_count",
-                    "EXCLUDE": "exclude_count",
-                    "MAYBE": "maybe_count",
-                }.get(new_decision)
-
-                if old_col and new_col and old_col != new_col:
-                    self.conn.execute(
-                        f"UPDATE progress SET {old_col} = MAX(0, {old_col} - 1) WHERE id = 1"
-                    )
-                    self.conn.execute(
-                        f"UPDATE progress SET {new_col} = {new_col} + 1 WHERE id = 1"
-                    )
+        self.rebuild_progress(current_key=key)
 
     # ====== 验证操作 ======
 
@@ -652,9 +729,22 @@ class DbManager:
         返回: 问题列表（空列表=一致）
         """
         issues = []
-        progress = self.get_progress()
+        stored_before = self._stored_progress()
+        progress = self.rebuild_progress()
 
-        # 1. 检查screening表计数与progress表一致
+        # 1. 检查重建前 progress 缓存是否曾经失真；verify 会自动修复缓存
+        cache_fields = [
+            "total", "processed", "remaining", "include_count", "exclude_count",
+            "maybe_count", "skipped_count", "error_count"
+        ]
+        for field in cache_fields:
+            if stored_before.get(field, 0) != progress.get(field, 0):
+                issues.append(
+                    f"progress缓存已自动修复: {field} "
+                    f"{stored_before.get(field, 0)} -> {progress.get(field, 0)}"
+                )
+
+        # 2. 检查screening表计数与重建后的progress一致
         counts = self.count_by_decision()
         if counts.get("INCLUDE", 0) != progress.get("include_count", 0):
             issues.append(
@@ -671,21 +761,39 @@ class DbManager:
                 f"MAYBE计数不一致: DB={counts.get('MAYBE',0)} "
                 f"progress={progress.get('maybe_count',0)}"
             )
+        if counts.get("SKIPPED", 0) != progress.get("skipped_count", 0):
+            issues.append(
+                f"SKIPPED计数不一致: DB={counts.get('SKIPPED',0)} "
+                f"progress={progress.get('skipped_count',0)}"
+            )
+        if counts.get("ERROR", 0) != progress.get("error_count", 0):
+            issues.append(
+                f"ERROR计数不一致: DB={counts.get('ERROR',0)} "
+                f"progress={progress.get('error_count',0)}"
+            )
 
-        # 2. 检查processed总数
+        # 3. 检查processed与remaining总数
         total_counted = sum(counts.values())
         if total_counted != progress.get("processed", 0):
             issues.append(
                 f"总数不一致: DB={total_counted} "
                 f"progress={progress.get('processed',0)}"
             )
+        if progress.get("processed", 0) + progress.get("remaining", 0) != progress.get("total", 0):
+            issues.append(
+                f"进度守恒不一致: processed+remaining="
+                f"{progress.get('processed',0) + progress.get('remaining',0)} "
+                f"total={progress.get('total',0)}"
+            )
 
-        # 3. 检查MD文件存在性
+        # 4. 检查MD文件存在性
         rows = self.conn.execute(
             "SELECT key, md_path FROM screening WHERE md_path IS NOT NULL"
         ).fetchall()
         for row in rows:
             md_path = Path(row["md_path"])
+            if not md_path.is_absolute():
+                md_path = self.db_path.parent / md_path
             if not md_path.exists():
                 issues.append(f"MD文件缺失: {row['key']} -> {row['md_path']}")
 
@@ -709,12 +817,12 @@ if __name__ == "__main__":
     with DbManager(db_path) as db:
         if args.command == "init":
             db.init_db()
-            print(f"✅ 数据库已初始化: {db_path}")
+            print(f"[OK] 数据库已初始化: {db_path}")
 
         elif args.command == "check":
             summary = db.get_summary()
             print(f"{'='*50}")
-            print(f"📊 筛选进度")
+            print(f"筛选进度")
             print(f"{'='*50}")
             print(f"  总数: {summary.get('total', 0)}")
             print(f"  已处理: {summary.get('processed', 0)}")
@@ -730,13 +838,13 @@ if __name__ == "__main__":
         elif args.command == "verify":
             issues = db.verify_consistency()
             if issues:
-                print(f"❌ 发现 {len(issues)} 个问题:")
+                print(f"[ERROR] 发现 {len(issues)} 个问题:")
                 for issue in issues:
                     print(f"  - {issue}")
             else:
-                print("✅ 数据一致性验证通过")
+                print("[OK] 数据一致性验证通过")
 
         elif args.command == "export":
             output = Path(args.output) if args.output else Path("screening_summary.csv")
             db.export_csv(output)
-            print(f"✅ 已导出: {output}")
+            print(f"[OK] 已导出: {output}")

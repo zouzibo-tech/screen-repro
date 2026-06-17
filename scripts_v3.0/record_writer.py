@@ -21,21 +21,27 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-# Windows兼容性：强制UTF-8编码
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# Windows兼容性：强制UTF-8编码（仅在直接运行时执行）
+if sys.platform == 'win32' and __name__ == '__main__':
+    if hasattr(sys.stdout, 'buffer'):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    if hasattr(sys.stderr, 'buffer'):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # 常量
 VALID_DECISIONS = {"INCLUDE", "EXCLUDE", "MAYBE"}
 VALID_CODES = {None, "", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9"}
-VALID_RESULTS = {"✅", "❌", "⚠️"}
+# 同时接受emoji和文本格式（picos_judge.py返回文本格式）
+VALID_RESULTS_EMOJI = {"✅", "❌", "⚠️"}
+VALID_RESULTS_TEXT = {"PASS", "FAIL", "UNCERTAIN"}
+VALID_RESULTS = VALID_RESULTS_EMOJI | VALID_RESULTS_TEXT
 
 # MD模板
 TEMPLATE = """# 筛选记录 — {key}
 
 > **筛选日期**：{screening_date}
-> **筛选版本**：screen-repro v3.0
+> **筛选版本**：screen-repro v3.1
+> **筛选轮次**：{screening_round}
 > **AI模型**：{model}
 > **筛选方法**：PDF全文阅读（AI自动判定）
 
@@ -156,7 +162,11 @@ def validate(data: dict) -> list[str]:
 
 def build_picos_section(dim: str, data: dict) -> str:
     """构建单个PICOS维度的MD段落"""
-    result_text = {"✅": "符合", "❌": "不符合", "⚠️": "不确定"}
+    # 纯文本到emoji的映射（支持两种格式输入）
+    result_emoji = {"PASS": "✅", "FAIL": "❌", "UNCERTAIN": "⚠️",
+                    "✅": "✅", "❌": "❌", "⚠️": "⚠️"}
+    result_text = {"PASS": "符合", "FAIL": "不符合", "UNCERTAIN": "不确定",
+                   "✅": "符合", "❌": "不符合", "⚠️": "不确定"}
 
     dim_labels = {
         "P": "人群 (Population)",
@@ -166,10 +176,14 @@ def build_picos_section(dim: str, data: dict) -> str:
         "S": "研究设计 (Study Design)",
     }
 
+    result = data.get('result', '?')
+    emoji = result_emoji.get(result, '')
+    text = result_text.get(result, '')
+
     lines = [
         f"### {dim} — {dim_labels.get(dim, dim)}",
         "",
-        f"**判定**：{data.get('result', '?')} {result_text.get(data.get('result', ''), '')}",
+        f"**判定**：{emoji} {text}",
         "",
     ]
 
@@ -213,6 +227,9 @@ def fill_template(data: dict) -> str:
     for dim in ["P", "I", "C", "O", "S"]:
         p_sections.append(build_picos_section(dim, picos.get(dim, {})))
 
+    # 确定筛选轮次
+    screening_round = data.get("screening_round", "正式筛选")
+
     return TEMPLATE.format(
         key=data.get("key", ""),
         title=data.get("title", ""),
@@ -232,6 +249,7 @@ def fill_template(data: dict) -> str:
         reason=data.get("reason", ""),
         model=data.get("model", "unknown"),
         screening_date=data.get("screened_at", now[:10]),
+        screening_round=screening_round,
         fingerprint=data.get("fingerprint", ""),
         model_version=data.get("model_version", ""),
         prompt_hash=data.get("prompt_hash", ""),

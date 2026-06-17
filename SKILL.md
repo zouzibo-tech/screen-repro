@@ -73,9 +73,10 @@ python screen.py run
 | `screen.py check` | 查看进度 |
 | `screen.py verify` | 验证数据一致性 |
 | `screen.py summary` | 汇总报告 |
+| `screen.py report` | 生成完整筛选报告（含决策分布、排除原因、年份分布、PICOS通过率、质量检查、筛选效率） |
 | `screen.py export` | 导出CSV |
 | `screen.py migrate` | 从v2.3迁移 |
-| `screen.py pdf map` | PDF映射 |
+| `screen.py pdf map` | PDF映射；执行前会校验数据库非空、创建 `_backups/*_before_pdf_map` 备份，并拒绝在错库/空库上运行 |
 | `screen.py workflow --ris xxx.ris` | 一键执行完整流程 |
 
 ---

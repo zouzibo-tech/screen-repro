@@ -18,11 +18,20 @@ CLI接口:
 import json
 import re
 import sys
+import io
 import time
 import hashlib
 import unicodedata
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+# Windows兼容性：强制子进程stdout/stderr使用UTF-8编码
+# 根因：中文Windows默认GBK编码，子进程print的中文JSON会被GBK编码，
+#       而父进程screen.py用encoding="utf-8"捕获，导致UnicodeDecodeError/乱码。
+#       必须在此处统一为UTF-8，与screen.py/record_writer.py保持一致。
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 
 # ====== 常量 ======
@@ -398,7 +407,7 @@ class QualityChecker:
             dim_data = result.get("picos", {}).get(dim, {})
             if "result" not in dim_data:
                 issues.append(f"{dim}维度缺少result")
-            elif dim_data["result"] not in ("✅", "❌", "⚠️"):
+            elif dim_data["result"] not in ("PASS", "FAIL", "UNCERTAIN"):
                 issues.append(f"{dim}维度result无效: {dim_data['result']}")
             if not dim_data.get("evidence"):
                 issues.append(f"{dim}维度缺少evidence")
@@ -407,17 +416,17 @@ class QualityChecker:
 
         # 5. 一致性检查
         picos = result.get("picos", {})
-        has_fail = any(picos.get(d, {}).get("result") == "❌" for d in "PICOS")
-        has_uncertain = any(picos.get(d, {}).get("result") == "⚠️" for d in "PICOS")
-        all_pass = all(picos.get(d, {}).get("result") == "✅" for d in "PICOS")
+        has_fail = any(picos.get(d, {}).get("result") == "FAIL" for d in "PICOS")
+        has_uncertain = any(picos.get(d, {}).get("result") == "UNCERTAIN" for d in "PICOS")
+        all_pass = all(picos.get(d, {}).get("result") == "PASS" for d in "PICOS")
 
         decision = result.get("decision")
         if all_pass and decision != "INCLUDE":
-            issues.append(f"五维度全✅但decision={decision}（应为INCLUDE）")
+            issues.append(f"五维度全PASS但decision={decision}（应为INCLUDE）")
         if has_fail and decision != "EXCLUDE":
-            issues.append(f"存在❌但decision={decision}（应为EXCLUDE）")
+            issues.append(f"存在FAIL但decision={decision}（应为EXCLUDE）")
         if has_uncertain and not has_fail and decision == "INCLUDE":
-            issues.append(f"存在⚠️但decision=INCLUDE（应为MAYBE）")
+            issues.append(f"存在UNCERTAIN但decision=INCLUDE（应为MAYBE）")
 
         # 6. evidence是否引用了原文
         for dim in "PICOS":
@@ -515,8 +524,12 @@ class PicosJudge:
                 if issues:
                     print(f"  [Judge] 质量问题: {', '.join(issues)}",
                           file=sys.stderr)
-                    # 如果有严重问题，重试
-                    if any("缺少" in i or "无效" in i for i in issues):
+                    # 严重问题触发重试：缺少字段、无效值、逻辑不一致
+                    severe = any(
+                        "缺少" in i or "无效" in i or "应为" in i
+                        for i in issues
+                    )
+                    if severe:
                         continue
 
                 # 填充元数据
@@ -584,7 +597,7 @@ class PicosJudge:
             "decision": "MAYBE",
             "exclusion_code": None,
             "picos": {
-                dim: {"result": "⚠️", "evidence": [], "analysis": reason}
+                dim: {"result": "UNCERTAIN", "evidence": [], "analysis": reason}
                 for dim in ["P", "I", "C", "O", "S"]
             },
             "reason": reason,
@@ -613,7 +626,7 @@ class PicosJudge:
 ## 行为规范
 1. 逐项检查P、I、C、O、S五个维度，不要跳过任何维度
 2. 每个维度的判定必须引用原文证据（标注具体段落或页码）
-3. 如果信息不足以判定某个维度，用⚠️标记并说明缺少什么信息
+3. 如果信息不足以判定某个维度，用UNCERTAIN标记并说明缺少什么信息
 4. 最终决策基于五个维度的综合判断
 5. 排除码按E1→E9顺序检查，标第一个命中的
 6. 保持客观，不要推测原文未明确说明的内容"""
@@ -651,31 +664,31 @@ class PicosJudge:
 
 ### 第1步：P（人群）
 - 参与者是否为高等教育阶段学习者或培训学员？
-- 如果无法确定 → ⚠️
+- 如果无法确定 → UNCERTAIN
 
 ### 第2步：I（干预）
 - 是否使用VR模拟器？设备类型是什么？
 - HMD_VR: Oculus/HTC Vive/Meta Quest/Pico等头戴设备
 - Desktop_VR: LapSim/LapMentor/EyeSi/FLS/da Vinci等桌面模拟器
-- 如果仅说"VR"未说明设备 → ⚠️，设备类型标注"需确认"
+- 如果仅说"VR"未说明设备 → UNCERTAIN，设备类型标注"需确认"
 
 ### 第3步：C（对照）
 - 是否有非VR对照组？
-- 仅比较VR内部条件 → ❌
+- 仅比较VR内部条件 → FAIL
 
 ### 第4步：O（结局）
 - 是否报告了技能保持（retention，延迟≥7天）或技能迁移（transfer）？
-- 仅有即时后测 → ❌
-- 如果报告了但延迟<7天 → ⚠️
+- 仅有即时后测 → FAIL
+- 如果报告了但延迟<7天 → UNCERTAIN
 
 ### 第5步：S（研究设计）
 - 是否为RCT或准实验设计？
-- 单组前后测 → ❌
+- 单组前后测 → FAIL
 
 ### 第6步：综合决策
-- 五个维度全部✅ → INCLUDE
-- 任一维度❌ → EXCLUDE（标排除码E1-E9）
-- 存在⚠️但无❌ → MAYBE
+- 五个维度全部PASS → INCLUDE
+- 任一维度FAIL → EXCLUDE（标排除码E1-E9）
+- 存在UNCERTAIN但无FAIL → MAYBE
 
 ## 输出要求
 
@@ -686,30 +699,30 @@ class PicosJudge:
   "exclusion_code": "E1-E9（仅EXCLUDE时填写，其他为null）",
   "picos": {{
     "P": {{
-      "result": "✅ 或 ❌ 或 ⚠️",
+      "result": "PASS 或 FAIL 或 UNCERTAIN",
       "evidence": ["原文引用1", "原文引用2"],
       "analysis": "简要分析"
     }},
     "I": {{
-      "result": "✅ 或 ❌ 或 ⚠️",
-      "device_type": "HMD_VR 或 Desktop_VR 或 非VR 或 ⚠️需确认",
+      "result": "PASS 或 FAIL 或 UNCERTAIN",
+      "device_type": "HMD_VR 或 Desktop_VR 或 非VR 或 UNCERTAIN",
       "evidence": ["原文引用"],
       "analysis": "简要分析"
     }},
     "C": {{
-      "result": "✅ 或 ❌ 或 ⚠️",
+      "result": "PASS 或 FAIL 或 UNCERTAIN",
       "evidence": ["原文引用"],
       "analysis": "简要分析"
     }},
     "O": {{
-      "result": "✅ 或 ❌ 或 ⚠️",
+      "result": "PASS 或 FAIL 或 UNCERTAIN",
       "outcome_type": "Retention 或 Transfer 或 Both 或 无",
       "retention_weeks": null,
       "evidence": ["原文引用"],
       "analysis": "简要分析"
     }},
     "S": {{
-      "result": "✅ 或 ❌ 或 ⚠️",
+      "result": "PASS 或 FAIL 或 UNCERTAIN",
       "design_type": "RCT 或 准实验 或 其他",
       "evidence": ["原文引用"],
       "analysis": "简要分析"
@@ -772,7 +785,7 @@ class PicosJudge:
         data.setdefault("reason", "")
         for dim in ["P", "I", "C", "O", "S"]:
             data["picos"].setdefault(dim, {
-                "result": "⚠️", "evidence": [], "analysis": "未判定"})
+                "result": "UNCERTAIN", "evidence": [], "analysis": "未判定"})
             data["picos"][dim].setdefault("evidence", [])
             data["picos"][dim].setdefault("analysis", "")
 

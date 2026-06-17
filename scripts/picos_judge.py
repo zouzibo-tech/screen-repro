@@ -18,11 +18,20 @@ CLI接口:
 import json
 import re
 import sys
+import io
 import time
 import hashlib
 import unicodedata
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+# Windows兼容性：强制子进程stdout/stderr使用UTF-8编码
+# 根因：中文Windows默认GBK编码，子进程print的中文JSON会被GBK编码，
+#       而父进程screen.py用encoding="utf-8"捕获，导致UnicodeDecodeError/乱码。
+#       必须在此处统一为UTF-8，与screen.py/record_writer.py保持一致。
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 
 # ====== 常量 ======
