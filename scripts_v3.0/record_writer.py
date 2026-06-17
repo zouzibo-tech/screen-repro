@@ -143,6 +143,12 @@ def validate(data: dict) -> list[str]:
     if data.get("decision") == "EXCLUDE" and not excl:
         errors.append("EXCLUDE决策必须提供排除码")
 
+    # 强制规则：INCLUDE必须有PDF路径
+    if data.get("decision") == "INCLUDE":
+        pdf_path = data.get("pdf_path")
+        if not pdf_path or pdf_path.strip() == "":
+            errors.append("INCLUDE决策必须提供PDF路径，无PDF的文献不能纳入")
+
     # PICOS维度
     picos = data.get("picos", {})
     for dim in ["P", "I", "C", "O", "S"]:

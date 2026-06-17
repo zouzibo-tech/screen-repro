@@ -341,8 +341,18 @@ class ScreeningOrchestrator:
                 data["text_hash"] = hashlib.md5(
                     text.encode()).hexdigest()[:16]
                 data["screening_round"] = "正式筛选"
+                
+                # 强制规则：如果没有PDF路径，不能标记为INCLUDE
+                if result["decision"] == "INCLUDE" and not data.get("pdf_path"):
+                    self.logger.warning(
+                        f"  强制规则：AI判定为INCLUDE但无PDF路径，改为SKIPPED"
+                    )
+                    data["decision"] = "SKIPPED"
+                    data["reason"] = "无PDF路径，不能纳入"
+                    data["exclusion_code"] = None
+                
                 md_path = write_record(data, self.db, self.base)
-                self.db.update_progress(paper["key"], result["decision"])
+                self.db.update_progress(paper["key"], data["decision"])
                 self.logger.info(f"  已写入: {md_path}")
             except Exception as e:
                 self.logger.error(f"  写入失败: {e}")
@@ -594,7 +604,10 @@ class ScreeningOrchestrator:
         return backup_dir
 
     def _map_pdfs(self):
-        """PDF映射：只写pdf_mapping.json，写入前执行数据库护栏和备份。"""
+        """PDF映射：只写pdf_mapping.json，写入前执行数据库护栏和备份。
+        
+        关键修复：使用数据库中的key格式（Author_Year_Hash6），而不是PDF文件名。
+        """
         try:
             db_state = self._guard_database_ready_for_pdf_map()
         except RuntimeError as exc:
@@ -614,18 +627,71 @@ class ScreeningOrchestrator:
         backup_dir = self._backup_pdf_map_state()
         self.logger.info(f"已创建PDF映射前备份: {backup_dir}")
 
-        mapping = {}
+        # 从数据库读取所有papers的元数据
+        papers = self.db.get_all_papers()
+        self.logger.info(f"从数据库读取 {len(papers)} 篇文献")
+
+        # 构建PDF文件索引：基于作者、年份、标题的模糊匹配
+        pdf_index = {}
         for pdf_file in pdf_files:
-            name = pdf_file.stem
-            mapping[name] = pdf_file.name
+            pdf_name = pdf_file.stem.lower()
+            pdf_index[pdf_name] = pdf_file
 
+        # 为每篇paper查找匹配的PDF
+        mapping = {}
+        matched_count = 0
+        unmatched_papers = []
+        unmatched_pdfs = set(pdf_index.keys())
+
+        for paper in papers:
+            key = paper['key']
+            author = paper.get('author', '').lower()
+            year = str(paper.get('year', ''))
+            title = paper.get('title', '').lower()
+
+            # 尝试多种匹配策略
+            matched_pdf = None
+
+            # 策略1：精确匹配key（如果PDF文件名就是key）
+            if key.lower() in pdf_index:
+                matched_pdf = pdf_index[key.lower()]
+
+            # 策略2：基于作者+年份+标题关键词匹配
+            if not matched_pdf and author and year and title:
+                # 提取第一作者姓氏
+                first_author = author.split(',')[0].split(';')[0].strip().split()[-1].lower() if author else ''
+                # 提取标题前30字符
+                title_prefix = title[:30].lower()
+
+                for pdf_name, pdf_file in pdf_index.items():
+                    # 检查是否包含作者姓氏、年份、标题关键词
+                    if (first_author in pdf_name and 
+                        year in pdf_name and 
+                        any(word in pdf_name for word in title_prefix.split()[:5])):
+                        matched_pdf = pdf_file
+                        break
+
+            if matched_pdf:
+                mapping[key] = matched_pdf.name
+                matched_count += 1
+                unmatched_pdfs.discard(matched_pdf.stem.lower())
+            else:
+                unmatched_papers.append(key)
+
+        # 统计结果
         paper_count = db_state["paper_count"]
-        if len(mapping) > paper_count * 2:
-            self.logger.warning(
-                f"PDF文件数({len(mapping)})显著多于文献数({paper_count})，"
-                "请确认pdfs目录属于当前项目。"
-            )
+        self.logger.info(f"PDF匹配结果: {matched_count}/{paper_count} 篇文献找到对应PDF")
 
+        if unmatched_papers:
+            self.logger.warning(f"未匹配文献数: {len(unmatched_papers)}")
+            # 记录前10个未匹配的文献
+            for key in unmatched_papers[:10]:
+                self.logger.warning(f"  未匹配: {key}")
+
+        if unmatched_pdfs:
+            self.logger.warning(f"未匹配PDF数: {len(unmatched_pdfs)}")
+
+        # 写入mapping
         mapping_path = self.base / "pdf_mapping.json"
         temp_mapping_path = mapping_path.with_suffix(".json.tmp")
         with open(temp_mapping_path, "w", encoding="utf-8") as f:
