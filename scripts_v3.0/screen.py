@@ -235,11 +235,11 @@ class ScreeningOrchestrator:
             should_exclude, reason = self._pre_screen(paper)
             if should_exclude:
                 self.logger.info(f"  预筛选排除: {reason}")
-                # 添加到screening表，标记为EXCLUDE
+                # 添加到screening表，标记为EXCLUDE（E7：综述/理论）
                 self.db.conn.execute("""
                     INSERT OR IGNORE INTO screening
                     (key, decision, exclusion_code, reason, screened_at, screening_round)
-                    VALUES (?, 'EXCLUDE', 'E1', ?, datetime('now'), '初筛')
+                    VALUES (?, 'EXCLUDE', 'E7', ?, datetime('now'), '初筛')
                 """, (paper["key"], reason))
                 self.db.conn.commit()
                 self.db.update_progress(paper["key"], "EXCLUDE")
