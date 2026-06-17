@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-screen.py — screen-repro v3.1 主编排器
+screen.py — screen-repro v3.2 主编排器
 ======================================
-单一入口，Python控制一切，AI只在PICOS判定时被调用。
+程序化优先：流程控制、校验、备份、报告全部程序化；AI仅保留给全文PICOS判定。
 数据存储：SQLite（权威） + MD文件（人类可读）
 
+三层架构:
+    - Orchestration Layer: 状态机、前置校验、备份、恢复、队列、批次、重试
+    - Extraction Layer: RIS导入、PDF匹配、PDF文本抽取、质量指标、缓存
+    - Judgment Layer: AI判定（仅负责PICOS全文判定，子进程隔离）
+
 特性:
+    - 程序化优先：流程控制、状态管理、数据校验全部由程序完成
     - 断点续跑：被中断后重新运行自动从上次位置继续
     - 信号处理：捕获 SIGINT/SIGTERM，当前文献处理完毕后安全退出
     - --base 参数：指定项目目录，不再依赖 cwd
     - 进度权威源：progress 表从 papers/screening 实时重建，永不失真
+    - 防御性校验：每个关键步骤都有前置校验，空库/错库/缺文件都会被拒绝
+    - 原子操作：文件写入先写临时文件，成功后再原子替换
 
 CLI命令:
     python screen.py init              # 初始化项目
     python screen.py import --ris xxx.ris  # 导入RIS文件
-    python screen.py prescreen         # 预筛选+AI复核+人机协同
-    python screen.py run               # 执行筛选循环（自动续跑）
-    python screen.py run --batch 10    # 筛选10篇后暂停
+    python screen.py run               # 执行筛选循环（自动续跑，含规则预筛+AI判定）
+    python screen.py run --batch 10    # 筛选N篇后暂停
     python screen.py run --base D:\\project  # 指定项目目录
     python screen.py check             # 查看进度
     python screen.py verify            # 验证一致性
@@ -24,7 +31,8 @@ CLI命令:
     python screen.py report            # 生成完整筛选报告
     python screen.py export            # 导出CSV
     python screen.py migrate           # 从v2.3迁移
-    python screen.py pdf map           # PDF映射
+    python screen.py pdf map           # PDF映射（含数据库前置校验+备份）
+    python screen.py prescreen         # 遗留模式：预筛选+AI复核+人机协同
     python screen.py workflow --ris xxx.ris  # 一键执行完整流程
 """
 
@@ -1243,20 +1251,26 @@ def migrate_from_v2(base: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="screen-repro v3.1 — 可复现的文献筛选系统",
+        description="screen-repro v3.2 — 程序化优先的PICOS文献筛选系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+screen-repro v3.2 — 程序化优先的PICOS文献筛选系统
+
+设计哲学：程序主导，AI辅助，可复现为本。
+三层架构：Orchestration（纯程序） → Extraction（纯程序） → Judgment（AI最小化）
+
 示例:
   python screen.py init              初始化项目
   python screen.py import --ris xxx.ris  导入RIS文件
-  python screen.py prescreen         预筛选+AI复核+人机协同
-  python screen.py run               执行筛选
+  python screen.py run               执行筛选（含规则预筛+AI判定）
   python screen.py run --batch 10    筛选10篇后暂停
   python screen.py run --base D:\\project  指定项目目录运行
   python screen.py check             查看进度
   python screen.py verify            验证一致性
   python screen.py report            生成完整筛选报告
   python screen.py export            导出CSV
+  python screen.py pdf map           PDF映射（含数据库前置校验+备份）
+  python screen.py prescreen         遗留模式：预筛选+AI复核+人机协同
   python screen.py workflow --ris xxx.ris  一键执行完整流程
         """
     )
@@ -1271,8 +1285,8 @@ def main():
     import_p = sub.add_parser("import", help="导入RIS文件")
     import_p.add_argument("--ris", required=True, help="RIS文件路径")
 
-    # prescreen
-    prescreen_p = sub.add_parser("prescreen", help="预筛选+AI复核+人机协同")
+    # prescreen (遗留模式)
+    prescreen_p = sub.add_parser("prescreen", help="遗留模式：预筛选+AI复核+人机协同")
     prescreen_p.add_argument("--batch", type=int, help="AI复核批次大小")
 
     # run
