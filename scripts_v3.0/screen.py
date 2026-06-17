@@ -48,6 +48,11 @@ import re
 import signal
 import hashlib
 import csv
+import shutil
+import time
+from pathlib import Path
+from datetime import datetime
+from tqdm import tqdm
 import sqlite3
 import shutil
 import time
@@ -211,6 +216,18 @@ class ScreeningOrchestrator:
             f"剩余:{progress['remaining']}"
         )
 
+        # 初始化进度条
+        pbar = tqdm(
+            total=progress['total'],
+            initial=progress['processed'],
+            desc="筛选进度",
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+            ncols=80
+        )
+
+        # 统计计数器
+        stats = {'INCLUDE': 0, 'EXCLUDE': 0, 'MAYBE': 0, 'SKIPPED': 0, 'ERROR': 0}
+
         while True:
             # 信号检查：收到终止信号后安全退出
             if _shutdown.check():
@@ -244,11 +261,14 @@ class ScreeningOrchestrator:
                 self.db.conn.commit()
                 self.db.update_progress(paper["key"], "EXCLUDE")
                 processed += 1
+                stats['EXCLUDE'] += 1
+                pbar.update(1)
+                pbar.set_postfix(stats)
                 continue
 
             # 3. PDF文本提取
             try:
-                text, tool = self._extract_pdf(paper)
+                text, tool, pdf_file_path = self._extract_pdf(paper)
                 if text is None:
                     self.logger.info("  无PDF，跳过")
                     # 添加到screening表，防止重复处理
@@ -260,6 +280,9 @@ class ScreeningOrchestrator:
                     self.db.conn.commit()
                     self.db.update_progress(paper["key"], "SKIPPED")
                     processed += 1
+                    stats['SKIPPED'] += 1
+                    pbar.update(1)
+                    pbar.set_postfix(stats)
                     
                     # 更新跳过计数
                     consecutive_skips += 1
@@ -293,6 +316,9 @@ class ScreeningOrchestrator:
                 self.db.conn.commit()
                 self.db.update_progress(paper["key"], "ERROR")
                 processed += 1
+                stats['ERROR'] += 1
+                pbar.update(1)
+                pbar.set_postfix(stats)
                 
                 # 更新跳过计数
                 consecutive_skips += 1
@@ -342,6 +368,9 @@ class ScreeningOrchestrator:
                     text.encode()).hexdigest()[:16]
                 data["screening_round"] = "正式筛选"
                 
+                # 设置pdf_path
+                data["pdf_path"] = str(pdf_file_path) if pdf_file_path else None
+                
                 # 强制规则：如果没有PDF路径，不能标记为INCLUDE
                 if result["decision"] == "INCLUDE" and not data.get("pdf_path"):
                     self.logger.warning(
@@ -354,6 +383,14 @@ class ScreeningOrchestrator:
                 md_path = write_record(data, self.db, self.base)
                 self.db.update_progress(paper["key"], data["decision"])
                 self.logger.info(f"  已写入: {md_path}")
+                
+                # 更新统计和进度条
+                decision = data["decision"]
+                if decision in stats:
+                    stats[decision] += 1
+                processed += 1
+                pbar.update(1)
+                pbar.set_postfix(stats)
             except Exception as e:
                 self.logger.error(f"  写入失败: {e}")
                 self.db.conn.execute("""
@@ -363,15 +400,21 @@ class ScreeningOrchestrator:
                 """, (paper["key"], str(e)[:200]))
                 self.db.conn.commit()
                 self.db.update_progress(paper["key"], "ERROR")
+                stats['ERROR'] += 1
+                processed += 1
+                pbar.update(1)
+                pbar.set_postfix(stats)
 
             # 5. 速率限制（rate_limiter已在picos_judge内部处理）
-            processed += 1
 
             # 6. 批次控制
             if batch_size and processed >= batch_size:
                 self.logger.info(f"已完成 {batch_size} 篇，暂停")
                 break
         
+        # 关闭进度条
+        pbar.close()
+
         # 循环结束后的统计
         if total_skips > 0:
             self.logger.warning(
@@ -471,16 +514,16 @@ class ScreeningOrchestrator:
 
     # ====== PDF处理 ======
 
-    def _extract_pdf(self, paper: dict) -> tuple[str, str] | tuple[None, None]:
+    def _extract_pdf(self, paper: dict) -> tuple[str, str, Path] | tuple[None, None, None]:
         """
         PDF文本提取
 
-        返回: (text, method) 或 (None, None)
+        返回: (text, method, pdf_path) 或 (None, None, None)
         """
         # 查找PDF文件
         pdf_path = self._find_pdf(paper)
         if not pdf_path:
-            return None, None
+            return None, None, None
 
         # 检查mining缓存
         mining_dir = self.base / "mining_output"
@@ -490,7 +533,7 @@ class ScreeningOrchestrator:
         if mining_path.exists():
             text = mining_path.read_text(encoding="utf-8")
             if len(text) > 100:
-                return text, "cached"
+                return text, "cached", pdf_path
 
         # 提取文本
         try:
@@ -503,13 +546,13 @@ class ScreeningOrchestrator:
 
             # 保存到mining缓存
             mining_path.write_text(text, encoding="utf-8")
-            return text, "PyMuPDF"
+            return text, "PyMuPDF", pdf_path
         except ImportError:
             self.logger.warning("PyMuPDF未安装，无法提取PDF")
-            return None, None
+            return None, None, None
         except Exception as e:
             self.logger.error(f"PDF提取失败: {e}")
-            return None, None
+            return None, None, None
 
     def _find_pdf(self, paper: dict) -> Path | None:
         """查找PDF文件"""

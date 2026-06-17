@@ -29,7 +29,7 @@ if sys.platform == 'win32' and __name__ == '__main__':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # 常量
-VALID_DECISIONS = {"INCLUDE", "EXCLUDE", "MAYBE"}
+VALID_DECISIONS = {"INCLUDE", "EXCLUDE", "MAYBE", "SKIPPED"}
 VALID_CODES = {None, "", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9"}
 # 同时接受emoji和文本格式（picos_judge.py返回文本格式）
 VALID_RESULTS_EMOJI = {"✅", "❌", "⚠️"}
