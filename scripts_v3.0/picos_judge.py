@@ -136,7 +136,7 @@ class OpenAIBackend(LLMBackend):
         super().__init__()
         self.api_key = config["api_key"]
         self.model = config.get("model", "gpt-4o")
-        self.base_url = config.get("base_url", "https://api.openai.com/v1")
+        self.base_url = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
         # 速率限制
         rate_config = config.get("rate_limit", {})
         self.rate_limiter = RateLimiter(
@@ -149,8 +149,55 @@ class OpenAIBackend(LLMBackend):
     def name(self):
         return f"openai/{self.model}"
 
+    @staticmethod
+    def _safe_response_prefix(text: str, limit: int = 800) -> str:
+        """Sanitize upstream response excerpts before writing them to logs."""
+        text = str(text or "")
+        text = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-***", text)
+        text = re.sub(r"Bearer\s+[A-Za-z0-9._-]+", "Bearer ***", text, flags=re.I)
+        text = text.replace("\r", " ").replace("\n", " ")
+        return text[:limit]
+
+    def _post_chat_completion(self, client, body: dict, *, json_mode: bool):
+        resp = client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=body,
+        )
+
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            raise RateLimitError(f"OpenAI-compatible 429; retry_after={retry_after}")
+
+        if resp.status_code < 200 or resp.status_code >= 300:
+            prefix = self._safe_response_prefix(resp.text)
+            raise JudgeError(
+                f"OpenAI-compatible API HTTP {resp.status_code}; "
+                f"json_mode={json_mode}; response_prefix={prefix}"
+            )
+
+        try:
+            return resp.json()
+        except Exception as exc:
+            prefix = self._safe_response_prefix(resp.text)
+            raise JudgeError(
+                f"OpenAI-compatible API returned non-JSON response; "
+                f"status={resp.status_code}; json_mode={json_mode}; "
+                f"response_prefix={prefix}; error={exc}"
+            )
+
+    def _extract_message_content(self, result: dict, *, json_mode: bool) -> str:
+        try:
+            return result["choices"][0]["message"]["content"]
+        except Exception as exc:
+            prefix = self._safe_response_prefix(json.dumps(result, ensure_ascii=False)[:1200])
+            raise JudgeError(
+                f"OpenAI-compatible API JSON missing choices[0].message.content; "
+                f"json_mode={json_mode}; response_prefix={prefix}; error={exc}"
+            )
+
     def call(self, user_prompt: str, system_prompt: str = "") -> str:
-        """调用OpenAI API，支持system prompt分离，自动限速"""
+        """调用OpenAI API，支持system prompt分离，自动限速。"""
         import httpx
 
         # 预估token数
@@ -171,41 +218,34 @@ class OpenAIBackend(LLMBackend):
         }
 
         with httpx.Client(timeout=120) as client:
-            resp = client.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=body,
-            )
+            try:
+                result = self._post_chat_completion(client, body, json_mode=True)
+            except JudgeError as exc:
+                # Some OpenAI-compatible relays do not support JSON mode. Retry once
+                # without response_format, while preserving the original failure in stderr.
+                msg = str(exc)
+                if "response_format" in msg or "json_mode=True" in msg or "json" in msg.lower():
+                    print(f"  [OpenAIBackend] JSON mode failed, retry without response_format: {msg}", file=sys.stderr)
+                    fallback_body = dict(body)
+                    fallback_body.pop("response_format", None)
+                    result = self._post_chat_completion(client, fallback_body, json_mode=False)
+                else:
+                    raise
 
-            # 处理429限流
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                print(f"  [RateLimit] 429响应，等待{retry_after}秒...",
-                      file=sys.stderr)
-                time.sleep(retry_after)
-                return self.call(user_prompt, system_prompt)
-
-            resp.raise_for_status()
-            result = resp.json()
-
-            # 记录实际token使用量
             usage = result.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
-            
-            # 更新token统计
+
             self.last_input_tokens = input_tokens
             self.last_output_tokens = output_tokens
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
-            
-            # 更新速率限制器
             self.rate_limiter.record(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
 
-            return result["choices"][0]["message"]["content"]
+            return self._extract_message_content(result, json_mode="response_format" in body)
 
 
 class AnthropicBackend(LLMBackend):
@@ -378,6 +418,13 @@ def extract_key_sections(text: str) -> dict:
 class QualityChecker:
     """判定结果质量检查器"""
 
+    @staticmethod
+    def _normalize_for_quote_match(value: str) -> str:
+        """规范化全文/证据句，用于反查 AI evidence 是否来自当前 txt。"""
+        value = unicodedata.normalize("NFKC", str(value or "")).lower()
+        value = re.sub(r"\s+", " ", value)
+        return value.strip()
+
     def check(self, result: dict, text: str = "") -> list[str]:
         """
         检查判定结果质量
@@ -399,7 +446,8 @@ class QualityChecker:
         # 3. EXCLUDE必须有排除码
         if result.get("decision") == "EXCLUDE":
             code = result.get("exclusion_code")
-            if not code or code not in [f"E{i}" for i in range(1, 10)]:
+            valid_codes = [f"E{i}" for i in range(1, 10)] + ["E10"]
+            if not code or code not in valid_codes:
                 issues.append(f"EXCLUDE但排除码无效: {code}")
 
         # 4. 每个PICOS维度完整性
@@ -428,12 +476,30 @@ class QualityChecker:
         if has_uncertain and not has_fail and decision == "INCLUDE":
             issues.append(f"存在UNCERTAIN但decision=INCLUDE（应为MAYBE）")
 
-        # 6. evidence是否引用了原文
+        # 6. evidence是否引用了原文。证据反查失败只标记 warning，不再作为严重问题触发整篇 MAYBE。
+        # 原因：PDF txt 抽取、模型引用省略号/页码、大小写和标点差异会导致严格字符串反查误伤。
+        normalized_text = self._normalize_for_quote_match(text) if text else ""
+        grounding_warnings = []
         for dim in "PICOS":
             evidence_list = picos.get(dim, {}).get("evidence", [])
             for ev in evidence_list:
-                if ev and len(ev) < 10:
+                if ev and len(str(ev)) < 10:
                     issues.append(f"{dim}维度evidence过短: '{ev}'")
+                    continue
+                if ev and normalized_text:
+                    normalized_ev = self._normalize_for_quote_match(str(ev))
+                    if len(normalized_ev) >= 20 and normalized_ev not in normalized_text:
+                        grounding_warnings.append(
+                            f"{dim}维度evidence未能在当前全文反查: '{str(ev)[:80]}'"
+                        )
+
+        if grounding_warnings:
+            result["evidence_grounding_warning"] = True
+            result["evidence_grounding_issues"] = grounding_warnings
+            print(
+                f"  [Judge] evidence grounding warning: {'; '.join(grounding_warnings[:8])}",
+                file=sys.stderr,
+            )
 
         return issues
 
@@ -498,7 +564,7 @@ class PicosJudge:
             {
                 "key": "...",
                 "decision": "INCLUDE/EXCLUDE/MAYBE",
-                "exclusion_code": "E1-E9" or null,
+                "exclusion_code": "E1-E10" or null,
                 "picos": { P: {...}, I: {...}, C: {...}, O: {...}, S: {...} },
                 "reason": "...",
                 "text_quality": "正常/异常",
@@ -577,8 +643,7 @@ class PicosJudge:
                     result["text_quality"] = "正常(JSON已修复)"
                     return result
                 except Exception:
-                    print(f"  [Judge] JSON解析失败 "
-                          f"({attempt+1}/{self.max_retries})", file=sys.stderr)
+                    print(f"  [Judge] JSON解析失败 ({attempt+1}/{self.max_retries}): {e}", file=sys.stderr)
             except Exception as e:
                 print(f"  [Judge] 调用异常: {e} "
                       f"({attempt+1}/{self.max_retries})", file=sys.stderr)
@@ -625,11 +690,15 @@ class PicosJudge:
 
 ## 行为规范
 1. 逐项检查P、I、C、O、S五个维度，不要跳过任何维度
-2. 每个维度的判定必须引用原文证据（标注具体段落或页码）
+2. 每个维度的判定必须引用原文证据，优先逐字复制全文中的短原句，不要改写或翻译证据句
 3. 如果信息不足以判定某个维度，用UNCERTAIN标记并说明缺少什么信息
 4. 最终决策基于五个维度的综合判断
-5. 排除码按E1→E9顺序检查，标第一个命中的
-6. 保持客观，不要推测原文未明确说明的内容"""
+5. 排除码按E1→E10顺序检查，标第一个命中的
+6. 保持客观，不要推测原文未明确说明的内容
+7. C维度必须从严：有comparison/control不等于有合格非VR对照；必须确认对照组未接受VR/virtual simulator训练
+8. E10硬规则：如果干预组和对照组都使用VR、virtual reality simulator、LapSim、LapMentor、MIST-VR、dVSS、EyeSi、Simodont、VirtaMed、ANGIO Mentor、Arthro VR等虚拟/VR模拟训练，只是反馈、haptic、2D/3D、训练目标、训练协议、训练时长不同，则C=FAIL，decision=EXCLUDE，exclusion_code=E10
+9. E5硬规则：如果没有独立对照组，或只是baseline vs post-test、训练前后比较、单组保留/迁移测试，或对照条件无法与干预组区分，则C或S=FAIL，decision=EXCLUDE，exclusion_code=E5
+10. 明确命中E10或E5时，不要为了保守而给MAYBE；只有原文信息确实不足以判断是否存在非VR对照时才给MAYBE"""
 
     def _build_prompt(self, text: str, paper_meta: dict) -> str:
         """用户提示词 — 包含PICOS规则、文献内容和输出要求"""
@@ -670,24 +739,37 @@ class PicosJudge:
 - 是否使用VR模拟器？设备类型是什么？
 - HMD_VR: Oculus/HTC Vive/Meta Quest/Pico等头戴设备
 - Desktop_VR: LapSim/LapMentor/EyeSi/FLS/da Vinci等桌面模拟器
-- 如果仅说"VR"未说明设备 → UNCERTAIN，设备类型标注"需确认"
+- 如果明确说了"VR"/"virtual reality"但未说明设备型号：
+  - 手术/医疗模拟器训练 → 推断为 Desktop_VR（标注"推断"）
+  - 头戴/沉浸式描述（VR glasses/headset/immersive） → 推断为 HMD_VR（标注"推断"）
+  - 仅说"VR training"无任何上下文 → UNCERTAIN，标注"需确认"
+- 全文完全没提VR → FAIL
 
 ### 第3步：C（对照）
 - 是否有非VR对照组？
-- 仅比较VR内部条件 → FAIL
+- 非VR对照包括：传统教学、视频教学、物理模拟、box trainer、FLS/实体trainer、无训练、空白对照 → PASS
+- 干预组用VR、对照组用常规训练/实体模拟/无训练 → PASS
+- E10硬规则：两组都用VR、virtual reality simulator、computerized VR simulator、LapSim、LapMentor、MIST-VR、dVSS、EyeSi、Simodont、VirtaMed、ANGIO Mentor、Arthro VR 等虚拟/VR模拟训练，即使只是 feedback vs no feedback、haptic vs non-haptic、2D vs 3D、adaptive vs fixed、mastery vs standard target、不同训练时长或不同VR设备 → C=FAIL，decision=EXCLUDE，exclusion_code=E10
+- E5硬规则：没有独立对照组、单组前后测、baseline vs post-test、只比较训练前后或保留/迁移时间点 → C或S=FAIL，decision=EXCLUDE，exclusion_code=E5
+- 看到 control/comparison/randomized 不足以判 C=PASS；必须确认对照组是非VR
+- 无对照组 → FAIL
 
 ### 第4步：O（结局）
-- 是否报告了技能保持（retention，延迟≥7天）或技能迁移（transfer）？
+- 是否报告了程序性技能保持（retention，延迟≥7天）或技能迁移（transfer）？
 - 仅有即时后测 → FAIL
-- 如果报告了但延迟<7天 → UNCERTAIN
+- 延迟<7天 → UNCERTAIN
+- 知识问卷/笔试/自评量表 → 非程序性技能，FAIL
+- OSATS/DOPS/GRS/操作评估/完成时间/准确性 → 程序性技能
+- 延迟后测在真实环境（OR/患者/尸体）评估 → 技能迁移
 
 ### 第5步：S（研究设计）
 - 是否为RCT或准实验设计？
-- 单组前后测 → FAIL
+- 单组前后测、单组训练后 retention/transfer、只有同一组不同时间点比较 → FAIL，并优先考虑 E5（无合格对照/设计不合格）
+- 经验分层/效度验证（novice vs expert, junior vs senior, known-groups validation）不是合格干预对照设计 → FAIL
 
 ### 第6步：综合决策
 - 五个维度全部PASS → INCLUDE
-- 任一维度FAIL → EXCLUDE（标排除码E1-E9）
+- 任一维度FAIL → EXCLUDE（标排除码E1-E10）
 - 存在UNCERTAIN但无FAIL → MAYBE
 
 ## 输出要求
@@ -696,7 +778,7 @@ class PicosJudge:
 
 {{
   "decision": "INCLUDE 或 EXCLUDE 或 MAYBE",
-  "exclusion_code": "E1-E9（仅EXCLUDE时填写，其他为null）",
+  "exclusion_code": "E1-E10（仅EXCLUDE时填写，其他为null)",
   "picos": {{
     "P": {{
       "result": "PASS 或 FAIL 或 UNCERTAIN",
@@ -728,6 +810,8 @@ class PicosJudge:
       "analysis": "简要分析"
     }}
   }},
+  "evidence_grounding_warning": false,
+  "evidence_grounding_issues": [],
   "reason": "一句话总结判定理由"
 }}"""
 
@@ -813,12 +897,32 @@ if __name__ == "__main__":
     parser.add_argument("--rules", required=True, help="PICOS_RULES.md路径")
     parser.add_argument("--input", required=True, help="文献文本文件路径")
     parser.add_argument("--meta", required=True, help="文献元数据JSON字符串")
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="可选：使用 config.json 中 review_profiles 的指定模型配置，例如 primary_gpt55 或 review_claude_opus_4_8",
+    )
     args = parser.parse_args()
 
     try:
         # 加载配置
         with open(args.config, encoding="utf-8") as f:
             config = json.load(f)
+        if args.profile:
+            profiles = config.get("review_profiles", {})
+            if args.profile not in profiles:
+                raise ValueError(
+                    f"未知profile: {args.profile}; 可用profile: {', '.join(sorted(profiles))}"
+                )
+            profile_config = dict(profiles[args.profile])
+            backend_type = profile_config.pop("llm_backend", "openai")
+            merged_config = dict(config)
+            merged_config["llm_backend"] = backend_type
+            backend_config = dict(config.get(backend_type, {}))
+            backend_config.update(profile_config)
+            merged_config[backend_type] = backend_config
+            merged_config["active_profile"] = args.profile
+            config = merged_config
         config["picos_rules_path"] = args.rules
 
         # 加载文本

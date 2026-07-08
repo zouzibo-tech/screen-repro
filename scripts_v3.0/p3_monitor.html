@@ -1,0 +1,74 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>P3 runtime monitor</title>
+<style>
+  body{font-family:Arial,"Microsoft YaHei",sans-serif;margin:0;background:#f7f7f4;color:#242424}
+  main{max-width:1120px;margin:0 auto;padding:24px}
+  h1{font-size:22px;font-weight:600;margin:0 0 6px}
+  .sub{color:#666;font-size:13px;margin-bottom:20px}
+  .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0}
+  .card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:14px 16px}
+  .label{font-size:12px;color:#666;margin-bottom:8px}.value{font-size:24px;font-weight:600}.small{font-size:13px;color:#555;line-height:1.5}
+  .ok{color:#146c43}.warn{color:#9a6700}.bad{color:#b42318}.muted{color:#777}
+  .bar{height:12px;background:#e6e6e0;border-radius:999px;overflow:hidden}.fill{height:100%;background:#1769aa;width:0%}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden}th,td{font-size:13px;text-align:left;border-bottom:1px solid #e7e7e2;padding:9px 10px;vertical-align:top}th{background:#f0f0eb;color:#555;font-weight:600}
+  code{background:#f0f0eb;border-radius:4px;padding:2px 4px}.mono{font-family:Consolas,"Courier New",monospace}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid #bbb;background:#fff;border-radius:8px;padding:8px 12px;cursor:pointer}.btn:hover{background:#f3f3ef}.pill{border-radius:999px;padding:4px 9px;font-size:12px;background:#eee}.pill.ok{background:#e2f4ea}.pill.warn{background:#fff3cd}.pill.bad{background:#fde7e9}
+  .actions{margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn.primary{background:#1769aa;color:#fff;border-color:#1769aa}.btn.primary:hover{background:#0f5c98}.btn:disabled{opacity:.55;cursor:not-allowed}.notice{font-size:13px;padding:8px 10px;border-radius:8px;background:#f0f0eb;color:#444}
+</style>
+<main>
+  <h1>P3 运行监控面板</h1>
+  <div class="sub">只读监控页：不修改数据库、锁池、PDF、txt 或筛选记录。若长任务仍在写 progress.log，本页会自动刷新读取。</div>
+  <div class="row">
+    <button class="btn" onclick="loadAll()">立即刷新</button>
+    <span class="small">状态文件：<code>03_Screening/qc/runtime/p3_runtime_status.json</code></span>
+    <span id="loadState" class="small muted"></span>
+  </div>
+  <section class="grid">
+    <div class="card"><div class="label">运行状态</div><div id="status" class="value muted">读取中</div><div id="health" class="small"></div></div>
+    <div class="card"><div class="label">进度</div><div id="progress" class="value">-</div><div class="bar"><div id="fill" class="fill"></div></div></div>
+    <div class="card"><div class="label">最后心跳</div><div id="heartbeat" class="value">-</div><div id="heartbeatAt" class="small"></div></div>
+    <div class="card"><div class="label">失败调用</div><div id="failed" class="value">-</div><div id="resume" class="small"></div></div>
+  </section>
+  <section class="card">
+    <div class="label">当前处理</div>
+    <div class="small">当前 UID：<code id="currentUid">-</code>　Profile：<code id="currentProfile">-</code></div>
+    <div class="small">最后成功：<code id="lastSuccess">-</code></div>
+    <div class="small">最近错误：<span id="lastError">无</span></div>
+    <div class="small">下一步建议：<strong id="nextAction">-</strong></div>
+  </section>
+  <section class="card" style="margin-top:12px">
+    <div class="label">手动控制</div>
+    <div class="small">如果你已经看到卡住，或者想立即从 checkpoint 继续，不用等 10 分钟自动续跑，可以点下面按钮。</div>
+    <div class="actions">
+      <button id="resumeBtn" class="btn primary" onclick="manualResume()">继续跑 / 断点续跑</button>
+      <span id="resumeActionState" class="notice">等待操作</span>
+    </div>
+    <div class="small" style="margin-top:8px">安全边界：按钮只调用当前 P3 双模型争议复核的恢复脚本，不直接修改数据库、锁池、PDF、txt 或筛选记录。</div>
+  </section>
+  <section class="card" style="margin-top:12px">
+    <div class="label">自动续跑监督器</div>
+    <div class="small">Auto-resume：<strong id="autoResume">-</strong>　自动子进程：<code id="childState">-</code>　手动子进程：<code id="manualChildState">-</code></div>
+    <div class="small">阈值：<code id="staleThreshold">-</code>　冷却：<code id="cooldown">-</code></div>
+    <div class="small">监督器更新时间：<span id="supervisorUpdated">-</span></div>
+  </section>
+  <h2 style="font-size:16px;margin-top:22px">最近事件</h2>
+  <table><thead><tr><th style="width:170px">时间</th><th style="width:130px">事件</th><th>UID</th><th style="width:180px">Profile</th><th>状态</th></tr></thead><tbody id="events"><tr><td colspan="5">读取中</td></tr></tbody></table>
+</main>
+<script>
+const statusUrl = "qc/runtime/p3_runtime_status.json?ts=";
+const eventsUrl = "qc/runtime/p3_runtime_events.jsonl?ts=";
+const supervisorUrl = "qc/runtime/p3_supervisor_state.json?ts=";
+const resumeUrl = "api/resume";
+function clsFor(s,h){if(s==="completed")return "ok"; if(s==="stale"||h==="possibly_interrupted")return "bad"; if(s==="unknown")return "warn"; return "ok";}
+function fmtAge(sec){if(sec===null||sec===undefined)return "未知"; if(sec<60)return Math.max(0,Math.round(sec))+" 秒"; if(sec<3600)return Math.round(sec/60)+" 分钟"; return (sec/3600).toFixed(1)+" 小时";}
+function setText(id,text){document.getElementById(id).textContent=text??"-";}
+function cell(text, cls){const td=document.createElement("td"); if(cls)td.className=cls; td.textContent=text??"-"; return td;}
+async function readJson(){const r=await fetch(statusUrl+Date.now(),{cache:"no-store"}); if(!r.ok)throw new Error("状态 JSON 读取失败："+r.status); return await r.json();}
+async function readEvents(){try{const r=await fetch(eventsUrl+Date.now(),{cache:"no-store"}); if(!r.ok)return []; const text=await r.text(); return text.trim().split(/\n+/).filter(Boolean).map(x=>{try{return JSON.parse(x)}catch(e){return {message:x,event:"raw"}}});}catch(e){return []}}
+async function readSupervisor(){try{const r=await fetch(supervisorUrl+Date.now(),{cache:"no-store"}); if(!r.ok)return {}; return await r.json();}catch(e){return {}}}
+function renderStatus(d, extraEvents){const c=clsFor(d.status,d.health); const statusEl=document.getElementById("status"); statusEl.className="value "+c; statusEl.textContent=d.status||"unknown"; setText("health",d.health||""); setText("progress",`${d.done||0} / ${d.total||0}`); document.getElementById("fill").style.width=(d.percent||0)+"%"; setText("heartbeat",fmtAge(d.heartbeat_age_seconds)); setText("heartbeatAt",d.last_heartbeat_at||"-"); setText("failed",d.failed_calls ?? 0); setText("resume",d.can_resume?"可断点续跑/继续检查":"无需续跑或状态不足"); setText("currentUid",d.current_uid||"-"); setText("currentProfile",d.current_profile||"-"); setText("lastSuccess",[d.last_success_uid,d.last_success_profile].filter(Boolean).join(" / ")||"-"); setText("lastError",d.last_error_reason||"无"); setText("nextAction",d.next_action||"-"); const events=(extraEvents.length?extraEvents:d.recent_events||[]).slice(-30).reverse(); const tb=document.getElementById("events"); tb.textContent=""; if(!events.length){const tr=document.createElement("tr"); const td=cell("暂无事件"); td.colSpan=5; tr.appendChild(td); tb.appendChild(tr); return;} for(const e of events){const tr=document.createElement("tr"); tr.appendChild(cell(e.time||"-","mono")); const eventTd=document.createElement("td"); const span=document.createElement("span"); span.className="pill"; span.textContent=e.event||"-"; eventTd.appendChild(span); tr.appendChild(eventTd); tr.appendChild(cell(e.uid||"-","mono")); tr.appendChild(cell(e.profile||"-","mono")); tr.appendChild(cell(e.state||e.message||"-")); tb.appendChild(tr);}}
+function renderSupervisor(s){setText("autoResume",s.auto_resume===true?"已开启":(s.auto_resume===false?"已关闭":"未知")); setText("childState",s.child_running?`running pid=${s.child_pid}`:"未运行"); setText("manualChildState",s.manual_child_running?`running pid=${s.manual_child_pid}`:"未运行"); setText("staleThreshold",s.stale_seconds?fmtAge(s.stale_seconds):"-"); setText("cooldown",s.cooldown_seconds?fmtAge(s.cooldown_seconds):"-"); setText("supervisorUpdated",s.updated_at||"-");}
+async function manualResume(){const btn=document.getElementById("resumeBtn"); const state=document.getElementById("resumeActionState"); btn.disabled=true; state.textContent="正在发送继续运行请求..."; try{const r=await fetch(resumeUrl,{method:"POST",cache:"no-store"}); const payload=await r.json().catch(()=>({message:"响应不是 JSON"})); state.textContent=payload.message||payload.status||`HTTP ${r.status}`; await loadAll();}catch(e){state.textContent="启动失败："+e.message;}finally{setTimeout(()=>{btn.disabled=false;},3000);}}
+async function loadAll(){const state=document.getElementById("loadState"); state.textContent="读取中..."; try{const [d,events,supervisor]=await Promise.all([readJson(),readEvents(),readSupervisor()]); renderStatus(d,events); renderSupervisor(supervisor); state.textContent="最后刷新："+new Date().toLocaleTimeString();}catch(e){state.textContent=e.message;}}
+loadAll(); setInterval(loadAll,15000);
+</script>

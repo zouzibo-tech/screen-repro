@@ -314,7 +314,7 @@ class HumanReviewer:
                 self.conn.execute("""
                     INSERT OR REPLACE INTO screening 
                     (key, decision, exclusion_code, reason, screened_at)
-                    VALUES (?, 'EXCLUDE', 'E1', ?, datetime('now'))
+                    VALUES (?, 'EXCLUDE', 'E7', ?, datetime('now'))
                 """, (paper['key'], f"AI复核确认：{paper['ai_reason']}"))
                 fixed += 1
             except Exception as e:

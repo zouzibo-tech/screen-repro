@@ -30,7 +30,7 @@ if sys.platform == 'win32' and __name__ == '__main__':
 
 # 常量
 VALID_DECISIONS = {"INCLUDE", "EXCLUDE", "MAYBE", "SKIPPED"}
-VALID_CODES = {None, "", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9"}
+VALID_CODES = {None, "", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10"}
 # 同时接受emoji和文本格式（picos_judge.py返回文本格式）
 VALID_RESULTS_EMOJI = {"✅", "❌", "⚠️"}
 VALID_RESULTS_TEXT = {"PASS", "FAIL", "UNCERTAIN"}
@@ -115,6 +115,193 @@ TEMPLATE = """# 筛选记录 — {key}
 def ts() -> str:
     """当前时间戳"""
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _normalize_result(value) -> str:
+    """统一PICOS判定值。"""
+    mapping = {
+        "✅": "PASS",
+        "❌": "FAIL",
+        "⚠️": "UNCERTAIN",
+        "PASS": "PASS",
+        "FAIL": "FAIL",
+        "UNCERTAIN": "UNCERTAIN",
+    }
+    return mapping.get(value, "")
+
+
+def _picos_text(dim_data: dict) -> str:
+    """拼接单个维度的可审计文本。"""
+    evidence = dim_data.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = []
+    parts = [
+        str(dim_data.get("analysis", "")),
+        str(dim_data.get("outcome_type", "")),
+        str(dim_data.get("device_type", "")),
+        " ".join(str(item) for item in evidence),
+    ]
+    return " ".join(parts).lower()
+
+
+def _outcome_fail_code(o_data: dict) -> str:
+    """O维度FAIL时区分E3和E4。"""
+    text = _picos_text(o_data)
+    non_procedural_terms = [
+        "knowledge", "cognitive", "written test", "mcq", "multiple-choice",
+        "quiz", "attitude", "satisfaction", "confidence", "self-efficacy",
+        "知识", "认知", "笔试", "选择题", "态度", "满意度", "自信",
+        "非程序", "非操作", "理论",
+    ]
+    if any(term in text for term in non_procedural_terms):
+        return "E3"
+    return "E4"
+
+
+def derive_decision(data: dict) -> tuple[str | None, str | None]:
+    """根据PICOS字段确定性重算最终决策和排除码。"""
+    picos = data.get("picos", {})
+    states = {dim: _normalize_result(picos.get(dim, {}).get("result"))
+              for dim in ["P", "I", "C", "O", "S"]}
+    if any(not state for state in states.values()):
+        return None, None
+
+    if all(state == "PASS" for state in states.values()):
+        return "INCLUDE", None
+    if any(state == "FAIL" for state in states.values()):
+        if states["P"] == "FAIL":
+            return "EXCLUDE", "E1"
+        if states["I"] == "FAIL":
+            return "EXCLUDE", "E2"
+        if states["O"] == "FAIL":
+            return "EXCLUDE", _outcome_fail_code(picos.get("O", {}))
+        if states["C"] == "FAIL":
+            # C=FAIL有两个可能：真正无对照组（E5）或VR内部比较（E10）
+            # 如果I文本暗示两组都用了VR，使用E10而非E5
+            c_data = picos.get("C", {})
+            i_data = picos.get("I", {})
+            if _has_internal_vr_comparator(c_data, i_data):
+                return "EXCLUDE", "E10"
+            return "EXCLUDE", "E5"
+        if states["S"] == "FAIL":
+            return "EXCLUDE", "E6"
+    return "MAYBE", None
+
+
+def _has_internal_vr_comparator(c_data: dict, i_data: dict | None = None) -> bool:
+    """检测VR内部比较：C文本含触发词，或I文本暗示所有组都用VR/模拟训练。"""
+    c_text = _picos_text(c_data).lower()
+
+    # C维度文本关键词检测：模型在C分析中主动提到了VR内部比较，或经验分层/已知组效度比较。
+    keywords = [
+        "vr内部", "vr 内部", "仅比较vr", "两组均为vr", "同一vr", "另一个vr",
+        "不是非vr对照", "非vr对照缺失", "vr vs vr", "hmd vs desktop",
+        "internal vr", "vr-only",
+        "both groups trained on the same", "both groups used the same",
+        "both groups used vr", "both groups received vr training",
+        "both groups practiced on", "两组均使用",
+        "junior", "senior", "expert", "novice", "experienced",
+        "experience level", "known-groups", "known groups", "validation study",
+        "proficiency-based test", "messick", "效度验证", "经验水平", "专家组", "新手组",
+    ]
+    if any(term in c_text for term in keywords):
+        return True
+
+    return False
+
+
+def _has_transfer_or_retention_signal(o_data: dict) -> bool:
+    text = _picos_text(o_data)
+    terms = [
+        "transfer", "transferred", "迁移", "operating room", "or performance",
+        "real-world", "real world", "clinical performance", "novel task",
+        "follow-up", "follow up", "retention", "delayed", "weeks", "months",
+        "真实环境", "真实手术", "临床表现", "随访", "延迟", "保持",
+    ]
+    negative_phrases = [
+        "no transfer", "without transfer", "no retention", "without retention",
+        "无transfer", "无 retention", "没有transfer", "没有 retention",
+        "未报告transfer", "未报告 retention", "无迁移", "无保持",
+    ]
+    return any(term in text for term in terms) and not any(phrase in text for phrase in negative_phrases)
+
+
+def _knowledge_retention_risk(o_data: dict) -> bool:
+    """检测O维度是否仅为knowledge retention而非程序性技能retention。
+
+    不再使用 procedural_terms 的负向覆盖机制（过于宽泛的"skill"、"performance"
+    等词会被AI在无关上下文中使用，导致门禁被抑制）。
+    改为正向匹配特定评估工具术语作为技能保持证据。
+    """
+    text = _picos_text(o_data).lower()
+    knowledge_terms = [
+        "knowledge retention", "knowledge test", "written test", "mcq",
+        "multiple-choice", "quiz", "cognitive", "知识保持", "知识保留",
+        "知识测试", "理论知识", "笔试", "选择题",
+    ]
+    # 使用特定评估工具术语作为程序性技能保持的正向证据
+    skill_tool_terms = [
+        "osats", "dops", "grs", "global rating",
+        "direct observation of procedural skills",
+        "proficiency score", "completion time",
+        "objective structured assessment", "operative performance",
+        "operative time", "operative duration",
+        "accuracy", "error score",
+        "procedure score", "technical skill",
+        "操作检查表", "操作清单", "手术表现",
+    ]
+    has_knowledge = any(term in text for term in knowledge_terms)
+    has_skill_tool = any(term in text for term in skill_tool_terms)
+
+    # 只有知识术语匹配，没有技能评估工具 → 高风险
+    return has_knowledge and not has_skill_tool
+
+
+def apply_hard_gate(data: dict) -> list[str]:
+    """写库前硬门禁：重算决策并把高风险语义冲突转为MAYBE。"""
+    issues = []
+    derived_decision, derived_code = derive_decision(data)
+    original_decision = data.get("decision")
+    original_code = data.get("exclusion_code")
+
+    if derived_decision:
+        if original_decision != derived_decision:
+            issues.append(
+                f"模型decision={original_decision}，PICOS重算={derived_decision}"
+            )
+            data["decision"] = derived_decision
+            data["exclusion_code"] = derived_code if derived_decision == "EXCLUDE" else None
+        elif derived_decision == "EXCLUDE" and original_code != derived_code:
+            issues.append(
+                f"模型排除码={original_code}，PICOS重算排除码={derived_code}"
+            )
+            data["exclusion_code"] = derived_code
+        elif derived_decision != "EXCLUDE":
+            data["exclusion_code"] = None
+
+    picos = data.get("picos", {})
+    c_data = picos.get("C", {})
+    i_data = picos.get("I", {})
+    o_data = picos.get("O", {})
+    o_result = _normalize_result(o_data.get("result"))
+
+    if data.get("decision") == "INCLUDE" and _has_internal_vr_comparator(c_data, i_data):
+        issues.append("C维度文本提示VR内部比较或非VR对照缺失，禁止直接INCLUDE")
+    if data.get("decision") == "EXCLUDE" and data.get("exclusion_code") == "E4":
+        if o_result == "FAIL" and _has_transfer_or_retention_signal(o_data):
+            issues.append("O维度文本出现transfer/retention/真实环境信号，禁止直接按E4排除")
+    if data.get("decision") == "INCLUDE" and _knowledge_retention_risk(o_data):
+        issues.append("O维度疑似仅为knowledge retention，禁止直接INCLUDE")
+
+    if issues:
+        data["hard_gate_issues"] = issues
+        data["decision"] = "MAYBE"
+        data["exclusion_code"] = None
+        note = "规则硬门禁转为MAYBE：" + "；".join(issues)
+        reason = data.get("reason", "")
+        data["reason"] = f"{reason}\n\n{note}" if reason else note
+
+    return issues
 
 
 def validate(data: dict) -> list[str]:
@@ -308,19 +495,22 @@ def write_record(data: dict, db, base) -> str:
     if isinstance(base, str):
         base = Path(base)
 
-    # 1. 验证数据
+    # 1. 写库前硬门禁：PICOS重算决策、排除码并拦截高风险语义冲突
+    apply_hard_gate(data)
+
+    # 2. 验证数据
     errors = validate(data)
     if errors:
         raise ValueError(f"数据验证失败: {'; '.join(errors)}")
 
-    # 2. 生成MD内容并写入
+    # 3. 生成MD内容并写入
     md_content = fill_template(data)
     md_path = write_md(md_content, data, base)
 
-    # 3. 更新data中的md_path
+    # 4. 更新data中的md_path
     data["md_path"] = md_path
 
-    # 4. 写入SQLite
+    # 5. 写入SQLite
     db.save_screening(data)
 
     print(f"[Record] 已写入: {md_path}")

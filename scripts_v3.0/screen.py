@@ -29,6 +29,7 @@ CLI命令:
     python screen.py verify            # 验证一致性
     python screen.py summary           # 汇总报告
     python screen.py report            # 生成完整筛选报告
+    python screen.py audit-rules       # 只读规则审计
     python screen.py export            # 导出CSV
     python screen.py migrate           # 从v2.3迁移
     python screen.py pdf map           # PDF映射（含数据库前置校验+备份）
@@ -50,6 +51,8 @@ import hashlib
 import csv
 import shutil
 import time
+import random
+import math
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
@@ -154,11 +157,11 @@ class ScreeningOrchestrator:
 
     def __init__(self, project_dir: Path, init_db: bool = True,
                  require_existing_db: bool = False):
-        self.base = project_dir
-        self.config = load_config(project_dir)
-        self.logger = setup_logging(project_dir)
+        self.base = self._resolve_project_base(project_dir)
+        self.config = load_config(self.base)
+        self.logger = setup_logging(self.base)
 
-        db_path = project_dir / DB_FILE
+        db_path = self.base / DB_FILE
         if require_existing_db and not db_path.exists():
             raise RuntimeError(f"数据库不存在: {db_path}")
 
@@ -170,6 +173,42 @@ class ScreeningOrchestrator:
         self.db.connect()
         if init_db:
             self.db.init_db()
+
+    @staticmethod
+    def _db_has_screening_data(db_path: Path) -> bool:
+        """判断SQLite库是否包含真实筛选数据，避免空库误导--base解析。"""
+        if not db_path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('papers', 'screening')"
+                ).fetchone()
+                if not row or row[0] < 2:
+                    return False
+                paper_count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+                screening_count = conn.execute("SELECT COUNT(*) FROM screening").fetchone()[0]
+                return paper_count > 0 or screening_count > 0
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
+
+    @staticmethod
+    def _resolve_project_base(project_dir: Path) -> Path:
+        """自动识别筛选项目根目录，兼容仓库根/03_Screening两种--base。"""
+        project_dir = project_dir.resolve()
+        direct_db = project_dir / DB_FILE
+        nested_dir = project_dir / "03_Screening"
+        nested_db = nested_dir / DB_FILE
+        if ScreeningOrchestrator._db_has_screening_data(direct_db):
+            return project_dir
+        if ScreeningOrchestrator._db_has_screening_data(nested_db):
+            return nested_dir
+        if project_dir.name == "03_Screening":
+            return project_dir
+        return project_dir
 
     def __del__(self):
         if hasattr(self, 'db') and self.db:
@@ -191,10 +230,13 @@ class ScreeningOrchestrator:
                 f"剩余:{progress['remaining']}"
             )
 
-        # 强制PDF匹配检查
+        # 强制PDF匹配检查：pdf_mapping.json 存在不等于映射可信。
+        # run 前必须通过题录-PDF 一致性门禁；失败时直接停止，避免错误全文进入 AI 判定。
         if not self._pdf_mapping_ready():
             self.logger.info("正在匹配PDF文件与文献库...")
             self._map_pdfs()
+            if not self._pdf_mapping_ready():
+                raise RuntimeError("PDF映射生成后仍未通过一致性门禁，停止筛选。")
 
         # 跳过统计仅用于告警，不再作为暂停条件。
         # 无PDF/提取失败的文献会写入screening表，因此不会造成死循环；
@@ -514,38 +556,132 @@ class ScreeningOrchestrator:
 
     # ====== PDF处理 ======
 
+    @staticmethod
+    def _normalize_doi_value(value) -> str:
+        """规范化 DOI 字符串，用于题录-PDF 一致性检查。"""
+        if value is None:
+            return ""
+        doi = str(value).strip().lower()
+        doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+        return doi.strip().rstrip(".,;)")
+
+    @staticmethod
+    def _normalize_text_for_match(value) -> str:
+        """规范化标题/PDF 文本，保留中英文和数字。"""
+        if value is None:
+            return ""
+        value = str(value).lower()
+        value = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    @classmethod
+    def _title_tokens(cls, title: str) -> set[str]:
+        stop = {
+            "a", "an", "the", "of", "and", "or", "in", "on", "for", "to", "with", "by", "from", "at", "as",
+            "study", "trial", "randomized", "controlled", "effects", "effect", "training", "virtual", "reality",
+        }
+        return {t for t in cls._normalize_text_for_match(title).split() if len(t) >= 4 and t not in stop}
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _extract_pdf_first_pages(pdf_path: Path, max_pages: int = 3) -> str:
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(str(pdf_path))
+            try:
+                return "\n".join(doc[i].get_text() for i in range(min(max_pages, doc.page_count)))
+            finally:
+                doc.close()
+        except Exception:
+            return ""
+
+    def _validate_pdf_candidate(self, paper: dict, pdf_path: Path) -> tuple[bool, str]:
+        """验证单篇题录与候选 PDF 是否匹配。
+
+        判定策略：DOI 命中或标题关键词命中率达标即可通过；两者都失败时拒绝。
+        这样可兼容旧论文 PDF 首页无 DOI 的情况，同时拦截 ChenP/ChenS 类明显错配。
+        """
+        if not pdf_path.exists():
+            return False, f"PDF不存在: {pdf_path}"
+        first_text = self._extract_pdf_first_pages(pdf_path, max_pages=3)
+        first_lower = first_text.lower()
+        first_norm = self._normalize_text_for_match(first_text)
+
+        doi = self._normalize_doi_value(paper.get("doi"))
+        doi_ok = False
+        if doi and first_text:
+            variants = {doi, doi.replace("/", ""), doi.replace("/", " ").replace("-", " ")}
+            doi_ok = any(v and v in first_lower for v in variants)
+
+        tokens = self._title_tokens(paper.get("title", ""))
+        title_ratio = 0.0
+        if tokens and first_norm:
+            found = sum(1 for token in tokens if token in first_norm)
+            title_ratio = found / max(len(tokens), 1)
+        title_ok = bool(tokens) and title_ratio >= 0.35
+
+        if doi_ok or title_ok:
+            return True, f"doi_ok={doi_ok}; title_overlap={title_ratio:.2f}; sha256={self._file_sha256(pdf_path)}"
+        if not first_text:
+            return False, "无法提取PDF前3页文本，不能验证题录-PDF一致性"
+        return False, f"DOI未命中且标题重叠过低: doi={doi or 'NA'}; title_overlap={title_ratio:.2f}; file={pdf_path.name}"
+
     def _extract_pdf(self, paper: dict) -> tuple[str, str, Path] | tuple[None, None, None]:
         """
         PDF文本提取
 
         返回: (text, method, pdf_path) 或 (None, None, None)
         """
-        # 查找PDF文件
+        # 查找并验证PDF文件
         pdf_path = self._find_pdf(paper)
         if not pdf_path:
             return None, None, None
 
-        # 检查mining缓存
+        pdf_sha = self._file_sha256(pdf_path)
+
+        # 检查mining缓存。缓存必须绑定当前PDF sha256；旧缓存无meta或hash不一致时强制重提取。
         mining_dir = self.base / "mining_output"
         mining_dir.mkdir(exist_ok=True)
         mining_path = mining_dir / f"{paper['key']}_mining.md"
+        mining_meta_path = mining_dir / f"{paper['key']}_mining.meta.json"
 
-        if mining_path.exists():
-            text = mining_path.read_text(encoding="utf-8")
-            if len(text) > 100:
+        if mining_path.exists() and mining_meta_path.exists():
+            try:
+                meta = json.loads(mining_meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            text = mining_path.read_text(encoding="utf-8", errors="replace")
+            if len(text) > 100 and meta.get("pdf_sha256") == pdf_sha:
                 return text, "cached", pdf_path
+            self.logger.warning(f"  mining缓存与当前PDF不一致，重新提取: {paper['key']}")
+        elif mining_path.exists():
+            self.logger.warning(f"  发现无sha256元数据的旧mining缓存，重新提取: {paper['key']}")
 
         # 提取文本
         try:
             import fitz  # PyMuPDF
             doc = fitz.open(str(pdf_path))
-            text = ""
-            for page in doc:
-                text += page.get_text()
-            doc.close()
+            try:
+                text = "".join(page.get_text() for page in doc)
+            finally:
+                doc.close()
 
-            # 保存到mining缓存
+            # 保存到mining缓存及绑定元数据
             mining_path.write_text(text, encoding="utf-8")
+            mining_meta_path.write_text(json.dumps({
+                "key": paper.get("key"),
+                "pdf_path": str(pdf_path),
+                "pdf_sha256": pdf_sha,
+                "extraction_method": "PyMuPDF",
+                "extracted_at": datetime.now().isoformat(timespec="seconds"),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
             return text, "PyMuPDF", pdf_path
         except ImportError:
             self.logger.warning("PyMuPDF未安装，无法提取PDF")
@@ -555,35 +691,83 @@ class ScreeningOrchestrator:
             return None, None, None
 
     def _find_pdf(self, paper: dict) -> Path | None:
-        """查找PDF文件"""
-        # 检查pdf_mapping.json
+        """查找PDF文件。候选 PDF 必须通过 DOI/标题一致性验证。"""
+        candidates: list[Path] = []
         mapping_path = self.base / "pdf_mapping.json"
         if mapping_path.exists():
             with open(mapping_path, encoding="utf-8") as f:
                 mapping = json.load(f)
             if paper["key"] in mapping:
-                pdf_path = self.base / "pdfs" / mapping[paper["key"]]
-                if pdf_path.exists():
-                    return pdf_path
+                mapped = Path(str(mapping[paper["key"]]))
+                candidates.append(mapped if mapped.is_absolute() else self.base / "pdfs" / mapped)
 
-        # 尝试默认路径
         pdf_dir = self.base / "pdfs"
         if pdf_dir.exists():
-            # 尝试key.pdf
-            pdf_path = pdf_dir / f"{paper['key']}.pdf"
-            if pdf_path.exists():
-                return pdf_path
-
-            # 尝试模糊匹配
+            candidates.append(pdf_dir / f"{paper['key']}.pdf")
+            # 模糊匹配只作为候选来源，绝不绕过一致性验证。
             for pdf_file in pdf_dir.glob("*.pdf"):
                 if paper["key"][:10] in pdf_file.stem:
-                    return pdf_file
+                    candidates.append(pdf_file)
 
+        seen = set()
+        for pdf_path in candidates:
+            key = str(pdf_path.resolve()) if pdf_path.exists() else str(pdf_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            ok, reason = self._validate_pdf_candidate(paper, pdf_path)
+            if ok:
+                return pdf_path
+            self.logger.warning(f"  PDF候选未通过一致性验证: {paper.get('key')} -> {pdf_path.name} | {reason}")
         return None
 
+    def _validate_pdf_mapping_file(self) -> None:
+        """验证 pdf_mapping.json 中所有映射，防止错误映射进入筛选。"""
+        mapping_path = self.base / "pdf_mapping.json"
+        if not mapping_path.exists():
+            raise RuntimeError("pdf_mapping.json 不存在")
+        with open(mapping_path, encoding="utf-8") as f:
+            mapping = json.load(f)
+        if not isinstance(mapping, dict):
+            raise RuntimeError("pdf_mapping.json 根对象不是字典")
+
+        papers = {paper["key"]: paper for paper in self.db.get_all_papers()}
+        by_sha: dict[str, list[str]] = {}
+        failures = []
+        for key, pdf_name in mapping.items():
+            paper = papers.get(key)
+            if not paper:
+                failures.append(f"映射中存在数据库没有的UID: {key}")
+                continue
+            pdf = Path(str(pdf_name))
+            if not pdf.is_absolute():
+                pdf = self.base / "pdfs" / pdf
+            ok, reason = self._validate_pdf_candidate(paper, pdf)
+            if not ok:
+                failures.append(f"{key}: {reason}")
+                continue
+            sha = self._file_sha256(pdf)
+            by_sha.setdefault(sha, []).append(key)
+
+        for sha, keys in by_sha.items():
+            if len(keys) <= 1:
+                continue
+            doi_set = {self._normalize_doi_value(papers[k].get("doi")) for k in keys}
+            title_set = {self._normalize_text_for_match(papers[k].get("title")) for k in keys}
+            if len(doi_set) > 1 or len(title_set) > 1:
+                failures.append(f"同一PDF sha256映射到多个不同题录: sha={sha}; keys={keys}")
+
+        if failures:
+            details = "\n".join(failures[:20])
+            raise RuntimeError(f"PDF映射一致性门禁失败，共{len(failures)}项。\n{details}")
+
     def _pdf_mapping_ready(self) -> bool:
-        """检查PDF映射是否就绪"""
-        return (self.base / "pdf_mapping.json").exists()
+        """检查PDF映射是否就绪：存在且通过题录-PDF一致性门禁。"""
+        mapping_path = self.base / "pdf_mapping.json"
+        if not mapping_path.exists():
+            return False
+        self._validate_pdf_mapping_file()
+        return True
 
     def _guard_database_ready_for_pdf_map(self) -> dict:
         """PDF映射前数据库安全检查，防止错库/空库场景。"""
@@ -917,11 +1101,211 @@ class ScreeningOrchestrator:
         except Exception:
             pass
 
+    def audit_rules(self) -> str:
+        """只读规则审计：生成方法学高风险候选清单，不修改数据库。"""
+        records_dir = self.base / "screening_records"
+        if not records_dir.exists():
+            records_dir = self.base / "03_Screening" / "screening_records"
+        if not records_dir.exists():
+            raise FileNotFoundError(
+                f"未找到screening_records目录: {self.base / 'screening_records'} 或 {self.base / '03_Screening' / 'screening_records'}"
+            )
+        reports_dir = self.base / "reports" / "screening_rule_audit"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = reports_dir / f"rule_audit_candidates_{date_str}.csv"
+        md_path = reports_dir / f"rule_audit_report_{date_str}.md"
+
+        def extract(pattern, text):
+            match = re.search(pattern, text, re.S)
+            return match.group(1).strip() if match else ""
+
+        def section(text, start, stop):
+            match = re.search(
+                rf"### {start}[\s\S]*?(?=---\n\n### {stop}|### {stop}|\n## 最终判定|\Z)",
+                text,
+            )
+            return match.group(0) if match else ""
+
+        def compact(text):
+            return re.sub(r"\s+", " ", text).strip()
+
+        def has_any(text, terms):
+            lower = text.lower()
+            return any(term.lower() in lower for term in terms)
+
+        internal_vr_terms = [
+            "VR内部", "VR 内部", "仅比较VR", "两组均为VR", "同一VR", "另一个VR",
+            "不是非VR对照", "非VR对照缺失", "VR vs VR", "HMD vs desktop",
+            "both groups", "internal VR", "VR-only",
+        ]
+        transfer_terms = [
+            "transfer", "迁移", "operating room", "OR performance", "real-world",
+            "real world", "clinical performance", "novel task", "follow-up", "follow up",
+            "retention", "retested", "maintenance", "delayed", "weeks", "months", "year",
+            "真实环境", "真实手术", "术中表现", "随访", "延迟", "保持",
+        ]
+        explicit_contradiction_terms = [
+            "应为INCLUDE", "应为 INCLUDE", "不应被排除", "所有五个维度均PASS",
+            "all five", "should be include", "应排除", "不应纳入",
+        ]
+        knowledge_terms = [
+            "knowledge retention", "knowledge test", "written test", "MCQ",
+            "multiple-choice", "quiz", "cognitive", "知识保持", "知识保留", "知识测试", "理论知识", "笔试", "选择题",
+        ]
+
+        rows = []
+        for path in sorted(records_dir.glob("*/*.md")):
+            if path.name == "TEMPLATE.md":
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            decision = extract(r"\*\*决策\*\*：\s*(\w+)", text) or path.parent.name
+            code = extract(r"\*\*排除码\*\*（如EXCLUDE）：\s*([^\n]+)", text)
+            title = extract(r"\| \*\*标题\*\* \| ([^|\n]+) \|", text)
+            c_text = section(text, "C ", "O ")
+            o_text = section(text, "O ", "S ")
+            reason = extract(r"\*\*判定理由\*\*：\s*([\s\S]*?)(?=\n---|\Z)", text)
+            risk_categories = []
+            if decision == "INCLUDE" and has_any(c_text + reason, internal_vr_terms):
+                risk_categories.append("C_INTERNAL_VR_INCLUDED")
+            if decision == "EXCLUDE" and has_any(o_text + reason, transfer_terms):
+                risk_categories.append("EXCLUDE_WITH_TRANSFER_OR_RETENTION_SIGNAL")
+            if decision == "INCLUDE" and has_any(o_text + reason, knowledge_terms):
+                risk_categories.append("KNOWLEDGE_RETENTION_INCLUDED")
+            if has_any(reason, explicit_contradiction_terms):
+                risk_categories.append("EXPLICIT_REASON_CONTRADICTION")
+            if not risk_categories:
+                continue
+            context = compact(c_text + " " + o_text + " " + reason)[:500]
+            rows.append({
+                "record_file": path.relative_to(self.base).as_posix(),
+                "decision": decision,
+                "exclusion_code": code,
+                "risk_categories": ";".join(risk_categories),
+                "title": title,
+                "context": context,
+            })
+
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+            fieldnames = ["record_file", "decision", "exclusion_code", "risk_categories", "title", "context"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        by_category = {}
+        for row in rows:
+            for category in row["risk_categories"].split(";"):
+                by_category[category] = by_category.get(category, 0) + 1
+
+        lines = [
+            "# screen-repro Rule Audit Report",
+            "",
+            f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
+            f"- Total candidates: {len(rows)}",
+            "- This is a read-only audit. It does not modify screening.db or MD records.",
+            "",
+            "## By Category",
+        ]
+        for category, count in sorted(by_category.items()):
+            lines.append(f"- {category}: {count}")
+        lines.extend(["", "## Candidates"])
+        for row in rows[:100]:
+            lines.append(
+                f"- `{row['record_file']}` | {row['decision']} | {row['exclusion_code']} | {row['risk_categories']}"
+            )
+        md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"[OK] 规则审计候选: {len(rows)}")
+        print(f"[OK] CSV: {csv_path}")
+        print(f"[OK] Report: {md_path}")
+        return str(md_path)
+
     def export_csv(self):
         """导出CSV"""
         csv_path = self.base / "screening_summary.csv"
         self.db.export_csv(csv_path)
         print(f"[OK] 已导出: {csv_path}")
+
+    def qa_generate(self, include_rate: float = 0.1, exclude_rate: float = 0.1,
+                    seed: int = 20260629, min_per_group: int = 1) -> str:
+        """按比例生成QA抽样清单，不修改数据库。"""
+        rows = self.db.conn.execute("""
+            SELECT
+                s.key, p.author, p.year, p.title, p.doi,
+                s.decision, s.exclusion_code, s.reason, s.screened_at,
+                s.md_path, s.pdf_path
+            FROM screening s
+            JOIN papers p ON s.key = p.key
+            WHERE s.decision IN ('INCLUDE', 'EXCLUDE')
+            ORDER BY s.key
+        """).fetchall()
+        groups = {"INCLUDE": [], "EXCLUDE": []}
+        for row in rows:
+            groups[row["decision"]].append(dict(row))
+
+        rng = random.Random(seed)
+        sample = []
+        config = {"INCLUDE": include_rate, "EXCLUDE": exclude_rate}
+        for decision, items in groups.items():
+            if not items:
+                continue
+            n = max(min_per_group, math.ceil(len(items) * config[decision]))
+            n = min(n, len(items))
+            picked = rng.sample(items, n)
+            for item in picked:
+                item["qa_group_total"] = len(items)
+                item["qa_sample_n"] = n
+                item["qa_rate"] = config[decision]
+                sample.append(item)
+
+        sample.sort(key=lambda item: (item["decision"], item["key"]))
+        qa_dir = self.base / "reports" / "screening_qa_samples"
+        qa_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = qa_dir / f"qa_sample_seed{seed}_{timestamp}.csv"
+        report_path = qa_dir / f"qa_sample_report_seed{seed}_{timestamp}.md"
+
+        fieldnames = [
+            "key", "author", "year", "title", "doi", "decision",
+            "exclusion_code", "reason", "screened_at", "md_path", "pdf_path",
+            "qa_group_total", "qa_sample_n", "qa_rate",
+        ]
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in sample:
+                writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+        lines = [
+            "# screen-repro QA Sample Report",
+            "",
+            f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
+            f"- Seed: {seed}",
+            f"- INCLUDE rate: {include_rate}",
+            f"- EXCLUDE rate: {exclude_rate}",
+            f"- INCLUDE sampled: {sum(1 for row in sample if row['decision'] == 'INCLUDE')} / {len(groups['INCLUDE'])}",
+            f"- EXCLUDE sampled: {sum(1 for row in sample if row['decision'] == 'EXCLUDE')} / {len(groups['EXCLUDE'])}",
+            "- This command only generates QA samples and does not modify screening decisions.",
+            "",
+            "## Sampled Records",
+        ]
+        for row in sample:
+            lines.append(
+                f"- `{row['key']}` | {row['decision']} | {row.get('exclusion_code') or ''} | {row.get('title') or ''}"
+            )
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"[OK] QA样本: {len(sample)}")
+        print(f"[OK] CSV: {csv_path}")
+        print(f"[OK] Report: {report_path}")
+        return str(csv_path)
+
+    def qa_status(self) -> dict:
+        """显示QA样本报告状态。"""
+        qa_dir = self.base / "reports" / "screening_qa_samples"
+        files = sorted(qa_dir.glob("qa_sample_*.csv")) if qa_dir.exists() else []
+        print(f"[OK] QA样本文件数: {len(files)}")
+        for path in files[-10:]:
+            print(f"  - {path}")
+        return {"sample_files": len(files)}
 
     def generate_report(self) -> str:
         """
@@ -1377,6 +1761,8 @@ screen-repro v3.2 — 程序化优先的PICOS文献筛选系统
   python screen.py check             查看进度
   python screen.py verify            验证一致性
   python screen.py report            生成完整筛选报告
+  python screen.py audit-rules       只读规则审计
+  python screen.py qa generate --include-rate 0.1 --exclude-rate 0.1 --seed 20260629
   python screen.py export            导出CSV
   python screen.py pdf map           PDF映射（含数据库前置校验+备份）
   python screen.py prescreen         遗留模式：预筛选+AI复核+人机协同
@@ -1387,43 +1773,58 @@ screen-repro v3.2 — 程序化优先的PICOS文献筛选系统
                         help="项目目录路径（默认使用当前目录）")
     sub = parser.add_subparsers(dest="command")
 
+    def add_base_arg(command_parser):
+        """允许--base放在子命令前或子命令后。"""
+        command_parser.add_argument(
+            "--base", type=str, default=None, help=argparse.SUPPRESS)
+        return command_parser
+
     # init
-    sub.add_parser("init", help="初始化项目")
+    add_base_arg(sub.add_parser("init", help="初始化项目"))
 
     # import
-    import_p = sub.add_parser("import", help="导入RIS文件")
+    import_p = add_base_arg(sub.add_parser("import", help="导入RIS文件"))
     import_p.add_argument("--ris", required=True, help="RIS文件路径")
 
     # prescreen (遗留模式)
-    prescreen_p = sub.add_parser("prescreen", help="遗留模式：预筛选+AI复核+人机协同")
+    prescreen_p = add_base_arg(sub.add_parser("prescreen", help="遗留模式：预筛选+AI复核+人机协同"))
     prescreen_p.add_argument("--batch", type=int, help="AI复核批次大小")
 
     # run
-    run_p = sub.add_parser("run", help="执行筛选")
+    run_p = add_base_arg(sub.add_parser("run", help="执行筛选"))
     run_p.add_argument("--batch", type=int, help="筛选N篇后暂停")
 
-    # check / verify / summary / export / report
-    sub.add_parser("check", help="查看进度")
-    sub.add_parser("verify", help="验证一致性")
-    sub.add_parser("summary", help="汇总报告")
-    sub.add_parser("export", help="导出CSV")
-    sub.add_parser("report", help="生成完整筛选报告")
+    # check / verify / summary / export / report / audit-rules
+    add_base_arg(sub.add_parser("check", help="查看进度"))
+    add_base_arg(sub.add_parser("verify", help="验证一致性"))
+    add_base_arg(sub.add_parser("summary", help="汇总报告"))
+    add_base_arg(sub.add_parser("export", help="导出CSV"))
+    add_base_arg(sub.add_parser("report", help="生成完整筛选报告"))
+    add_base_arg(sub.add_parser("audit-rules", help="只读规则审计"))
 
     # migrate
-    sub.add_parser("migrate", help="从v2.3迁移")
+    add_base_arg(sub.add_parser("migrate", help="从v2.3迁移"))
 
     # pdf
-    pdf_p = sub.add_parser("pdf", help="PDF管理")
+    pdf_p = add_base_arg(sub.add_parser("pdf", help="PDF管理"))
     pdf_p.add_argument("action", choices=["map", "map-update"])
 
     # qa
-    qa_p = sub.add_parser("qa", help="QA管理")
+    qa_p = add_base_arg(sub.add_parser("qa", help="QA管理"))
     qa_p.add_argument("action",
                       choices=["generate", "resolve", "confirm", "status"])
+    qa_p.add_argument("--include-rate", type=float, default=0.1,
+                      help="INCLUDE抽样比例，默认0.1")
+    qa_p.add_argument("--exclude-rate", type=float, default=0.1,
+                      help="EXCLUDE抽样比例，默认0.1")
+    qa_p.add_argument("--seed", type=int, default=20260629,
+                      help="随机种子，默认20260629")
+    qa_p.add_argument("--min-per-group", type=int, default=1,
+                      help="每组最少抽样数，默认1")
     qa_p.add_argument("args", nargs="*")
 
     # workflow
-    workflow_p = sub.add_parser("workflow", help="一键执行完整流程")
+    workflow_p = add_base_arg(sub.add_parser("workflow", help="一键执行完整流程"))
     workflow_p.add_argument("--ris", required=True, help="RIS文件路径")
     workflow_p.add_argument("--batch", type=int, help="AI复核批次大小")
 
@@ -1472,6 +1873,10 @@ screen-repro v3.2 — 程序化优先的PICOS文献筛选系统
         orch = ScreeningOrchestrator(base)
         orch.generate_report()
 
+    elif args.command == "audit-rules":
+        orch = ScreeningOrchestrator(base)
+        orch.audit_rules()
+
     elif args.command == "export":
         orch = ScreeningOrchestrator(base)
         orch.export_csv()
@@ -1490,7 +1895,18 @@ screen-repro v3.2 — 程序化优先的PICOS文献筛选系统
             orch._map_pdfs()
 
     elif args.command == "qa":
-        print("QA功能尚未实现")
+        orch = ScreeningOrchestrator(base)
+        if args.action == "generate":
+            orch.qa_generate(
+                include_rate=args.include_rate,
+                exclude_rate=args.exclude_rate,
+                seed=args.seed,
+                min_per_group=args.min_per_group,
+            )
+        elif args.action == "status":
+            orch.qa_status()
+        else:
+            print("该QA子命令尚未实现；当前已支持 generate/status")
 
     elif args.command == "workflow":
         run_workflow(base, args.ris, batch_size=args.batch)
